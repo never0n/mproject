@@ -1,0 +1,526 @@
+{
+  "status": "prepared_for_cursor_not_integrated",
+  "coordinates": "GLB: X right, Y up, front +Z (Blender front -Y); meters",
+  "assets": [
+    {
+      "id": "01_gatehouse",
+      "target": "Крепостные ворота",
+      "asset_path": "environment/reference_city_v1/glb/01_gatehouse.glb",
+      "scene": 0,
+      "sha256": "ccc20e6f7b4cd23a3f74bf7bd179de9f2b289b6c3871c91d62a4ef2aaef3f11a",
+      "bounds_gltf_min": [
+        -5.179348468780518,
+        0,
+        -1.3793482780456543
+      ],
+      "bounds_gltf_max": [
+        5.179348468780518,
+        11.600000381469727,
+        1.550285816192627
+      ],
+      "size_gltf": [
+        10.3587,
+        11.6,
+        2.92963
+      ],
+      "ground_offset_y": 0,
+      "triangles": 319560,
+      "primitives": 13,
+      "textures": 0
+    },
+    {
+      "id": "02_curtain_wall",
+      "target": "Секции крепостной стены",
+      "asset_path": "environment/reference_city_v1/glb/02_curtain_wall.glb",
+      "scene": 0,
+      "sha256": "4f2b78d249e98d2e2c1be870cd819506fa0da2bb9b8ed42d90560c57fc0e5fd3",
+      "bounds_gltf_min": [
+        -3.5,
+        0.004999999888241291,
+        -0.5099999904632568
+      ],
+      "bounds_gltf_max": [
+        3.5,
+        4.121500015258789,
+        1.0225000381469727
+      ],
+      "size_gltf": [
+        7.0,
+        4.1165,
+        1.5325
+      ],
+      "ground_offset_y": -0.004999999888241291,
+      "triangles": 19764,
+      "primitives": 5,
+      "textures": 0
+    },
+    {
+      "id": "03_watchtower",
+      "target": "Башни крепостной стены",
+      "asset_path": "environment/reference_city_v1/glb/03_watchtower.glb",
+      "scene": 0,
+      "sha256": "80c2e02e7a31cf6d5ef77bdfa20d0165144d7b4cde0c337a8fb7bcdadb4feb02",
+      "bounds_gltf_min": [
+        -1.220451831817627,
+        0,
+        -1.220451831817627
+      ],
+      "bounds_gltf_max": [
+        1.220451831817627,
+        10,
+        1.220451831817627
+      ],
+      "size_gltf": [
+        2.4409,
+        10,
+        2.4409
+      ],
+      "ground_offset_y": 0,
+      "triangles": 95356,
+      "primitives": 11,
+      "textures": 0
+    },
+    {
+      "id": "04_merchant_house",
+      "target": "Жилые дома: крупный вариант",
+      "asset_path": "environment/reference_city_v1/glb/04_merchant_house.glb",
+      "scene": 0,
+      "sha256": "b47e3ecf9f60e869e0de7fd7b6f5c1dd61a21ef4b139dff8d02a170423e5d667",
+      "bounds_gltf_min": [
+        -2.7649998664855957,
+        -0.014999999664723873,
+        -2.2100000381469727
+      ],
+      "bounds_gltf_max": [
+        2.7649998664855957,
+        7.400000095367432,
+        3.4213099479675293
+      ],
+      "size_gltf": [
+        5.53,
+        7.415,
+        5.63131
+      ],
+      "ground_offset_y": 0.014999999664723873,
+      "triangles": 97344,
+      "primitives": 28,
+      "textures": 0
+    },
+    {
+      "id": "05_small_house",
+      "target": "Жилые дома: малый вариант",
+      "asset_path": "environment/reference_city_v1/glb/05_small_house.glb",
+      "scene": 0,
+      "sha256": "016addbac054f7eff93b932295cbc543287ecf257ea9c7e553aee8e283c86a6b",
+      "bounds_gltf_min": [
+        -2.115000009536743,
+        -0.014999999664723873,
+        -1.8350000381469727
+      ],
+      "bounds_gltf_max": [
+        2.115000009536743,
+        5.449999809265137,
+        2.7200000286102295
+      ],
+      "size_gltf": [
+        4.23,
+        5.465,
+        4.555
+      ],
+      "ground_offset_y": 0.014999999664723873,
+      "triangles": 60148,
+      "primitives": 27,
+      "textures": 0
+    },
+    {
+      "id": "06_blacksmith_forge",
+      "target": "Рабочая зона кузнеца, не весь дом гильдий",
+      "asset_path": "environment/reference_city_v1/glb/06_blacksmith_forge.glb",
+      "scene": 0,
+      "sha256": "8b7773c6f497160ea0f38989d22a9887109505b5cd09b7fad863823eeff5d121",
+      "bounds_gltf_min": [
+        -2.31499981880188,
+        0,
+        -1.475000023841858
+      ],
+      "bounds_gltf_max": [
+        2.31499981880188,
+        4.882999897003174,
+        1.7342432737350464
+      ],
+      "size_gltf": [
+        4.63,
+        4.883,
+        3.20924
+      ],
+      "ground_offset_y": 0,
+      "triangles": 70696,
+      "primitives": 19,
+      "textures": 0
+    },
+    {
+      "id": "07_anvil",
+      "target": "Наковальня Борина",
+      "asset_path": "environment/reference_city_v1/glb/07_anvil.glb",
+      "scene": 0,
+      "sha256": "8d3328d3eacaf2e5e36a38aeee35954d61e186a8a4c3195dab5a02f35c34045e",
+      "bounds_gltf_min": [
+        -0.8882748484611511,
+        0,
+        -0.4953121542930603
+      ],
+      "bounds_gltf_max": [
+        0.5860000252723694,
+        1.510908842086792,
+        0.4953121542930603
+      ],
+      "size_gltf": [
+        1.47427,
+        1.51091,
+        0.99062
+      ],
+      "ground_offset_y": 0,
+      "triangles": 10832,
+      "primitives": 5,
+      "textures": 0
+    },
+    {
+      "id": "08_blacksmith_sign",
+      "target": "Вывеска кузницы",
+      "asset_path": "environment/reference_city_v1/glb/08_blacksmith_sign.glb",
+      "scene": 0,
+      "sha256": "e200cbe9658c041a96e3228b6f9025a919414a9e0cc39548bcddcf510080a8e2",
+      "bounds_gltf_min": [
+        -0.8700000047683716,
+        0,
+        -0.12999999523162842
+      ],
+      "bounds_gltf_max": [
+        0.7950000166893005,
+        2.799999952316284,
+        0.1979999989271164
+      ],
+      "size_gltf": [
+        1.665,
+        2.8,
+        0.328
+      ],
+      "ground_offset_y": 0,
+      "triangles": 9292,
+      "primitives": 6,
+      "textures": 0
+    },
+    {
+      "id": "09_fountain",
+      "target": "Фонтан центральной площади",
+      "asset_path": "environment/reference_city_v1/glb/09_fountain.glb",
+      "scene": 0,
+      "sha256": "7d19c53f3acfa3cb96b52107f80ce7c6d54a48cbdbd00fbc774ca4961638f397",
+      "bounds_gltf_min": [
+        -2.513657569885254,
+        0,
+        -2.3499999046325684
+      ],
+      "bounds_gltf_max": [
+        2.4269633293151855,
+        3.869999885559082,
+        2.3499999046325684
+      ],
+      "size_gltf": [
+        4.94062,
+        3.87,
+        4.7
+      ],
+      "ground_offset_y": 0,
+      "triangles": 91644,
+      "primitives": 18,
+      "textures": 0
+    },
+    {
+      "id": "10_market_stall",
+      "target": "Рыночные палатки",
+      "asset_path": "environment/reference_city_v1/glb/10_market_stall.glb",
+      "scene": 0,
+      "sha256": "f371cbee98fbf61cd3385ede2777ad5dc9378010b2f03b98608b29117a004a12",
+      "bounds_gltf_min": [
+        -1.9192999601364136,
+        -0.029999999329447746,
+        -0.925000011920929
+      ],
+      "bounds_gltf_max": [
+        1.7549999952316284,
+        2.9700000286102295,
+        1.2293866872787476
+      ],
+      "size_gltf": [
+        3.6743,
+        3.0,
+        2.15439
+      ],
+      "ground_offset_y": 0.029999999329447746,
+      "triangles": 89080,
+      "primitives": 15,
+      "textures": 0
+    },
+    {
+      "id": "11_street_lantern",
+      "target": "Уличные фонари",
+      "asset_path": "environment/reference_city_v1/glb/11_street_lantern.glb",
+      "scene": 0,
+      "sha256": "a6707544cb46dd3d711e000b17cc209a7e4a697bf4008fed4b4f698116f63c37",
+      "bounds_gltf_min": [
+        -0.35149332880973816,
+        0,
+        -0.35149332880973816
+      ],
+      "bounds_gltf_max": [
+        0.35149332880973816,
+        3.7955000400543213,
+        0.35149332880973816
+      ],
+      "size_gltf": [
+        0.70299,
+        3.7955,
+        0.70299
+      ],
+      "ground_offset_y": 0,
+      "triangles": 5188,
+      "primitives": 3,
+      "textures": 0
+    },
+    {
+      "id": "12_wall_lantern",
+      "target": "Настенные фонари",
+      "asset_path": "environment/reference_city_v1/glb/12_wall_lantern.glb",
+      "scene": 0,
+      "sha256": "45a9e184d561cde71b9d25c90db8203843c195bea0f96106b68acb720018cf18",
+      "bounds_gltf_min": [
+        -0.320928692817688,
+        0,
+        -0.30000001192092896
+      ],
+      "bounds_gltf_max": [
+        0.320928692817688,
+        1.659999966621399,
+        1.0009286403656006
+      ],
+      "size_gltf": [
+        0.64186,
+        1.66,
+        1.30093
+      ],
+      "ground_offset_y": 0,
+      "triangles": 3696,
+      "primitives": 4,
+      "textures": 0
+    },
+    {
+      "id": "13_royal_banner",
+      "target": "Знамёна города",
+      "asset_path": "environment/reference_city_v1/glb/13_royal_banner.glb",
+      "scene": 0,
+      "sha256": "da9788ca16839f81ae200b0a283c80e4c1440414f9f651397bcb07360e8ae64b",
+      "bounds_gltf_min": [
+        -1.041599988937378,
+        0.07687802612781525,
+        -0.1184086948633194
+      ],
+      "bounds_gltf_max": [
+        1.041599988937378,
+        3.089600086212158,
+        0.11553696542978287
+      ],
+      "size_gltf": [
+        2.0832,
+        3.01272,
+        0.23395
+      ],
+      "ground_offset_y": -0.07687802612781525,
+      "triangles": 44024,
+      "primitives": 2,
+      "textures": 0
+    },
+    {
+      "id": "14_wooden_crates",
+      "target": "Ящики у торговцев",
+      "asset_path": "environment/reference_city_v1/glb/14_wooden_crates.glb",
+      "scene": 0,
+      "sha256": "f7b8e421222c54f63fc69acb4cf6ea5045b5d255ef2346b60d375b6dab630c64",
+      "bounds_gltf_min": [
+        -1.0507500171661377,
+        0,
+        -0.5910600423812866
+      ],
+      "bounds_gltf_max": [
+        1.0547000169754028,
+        1.6605000495910645,
+        0.5058500170707703
+      ],
+      "size_gltf": [
+        2.10545,
+        1.6605,
+        1.09691
+      ],
+      "ground_offset_y": 0,
+      "triangles": 22440,
+      "primitives": 7,
+      "textures": 0
+    },
+    {
+      "id": "15_merchant_counter",
+      "target": "Прилавки торговцев",
+      "asset_path": "environment/reference_city_v1/glb/15_merchant_counter.glb",
+      "scene": 0,
+      "sha256": "e3e394f1e322e5c0892af74663ebdcb4d176ea1628384086166d2ea7332f6aa4",
+      "bounds_gltf_min": [
+        -1.399999976158142,
+        -0.029999999329447746,
+        -0.515500009059906
+      ],
+      "bounds_gltf_max": [
+        1.7694458961486816,
+        1.4943000078201294,
+        0.5499035120010376
+      ],
+      "size_gltf": [
+        3.16945,
+        1.5243,
+        1.0654
+      ],
+      "ground_offset_y": 0.029999999329447746,
+      "triangles": 49284,
+      "primitives": 12,
+      "textures": 0
+    },
+    {
+      "id": "16_square_flower_planter",
+      "target": "Декор площади: квадратные клумбы",
+      "asset_path": "environment/reference_city_v1/glb/16_square_flower_planter.glb",
+      "scene": 0,
+      "sha256": "76b409658db4bf8fb9fcf50171e4b4251e3ed6254931b4f5e688f5ab57cce149",
+      "bounds_gltf_min": [
+        -0.6748597025871277,
+        -0.029999999329447746,
+        -0.749523937702179
+      ],
+      "bounds_gltf_max": [
+        0.7263652086257935,
+        1.2548959255218506,
+        0.7849079966545105
+      ],
+      "size_gltf": [
+        1.40122,
+        1.2849,
+        1.53443
+      ],
+      "ground_offset_y": 0.029999999329447746,
+      "triangles": 47488,
+      "primitives": 14,
+      "textures": 0
+    },
+    {
+      "id": "17_long_flower_planter",
+      "target": "Декор площади: длинные клумбы",
+      "asset_path": "environment/reference_city_v1/glb/17_long_flower_planter.glb",
+      "scene": 0,
+      "sha256": "d8861b581931080416df54a361e1d567be0edad0147be438c8ace7717ecfd05b",
+      "bounds_gltf_min": [
+        -1.3841052055358887,
+        -0.029999999329447746,
+        -0.5987521409988403
+      ],
+      "bounds_gltf_max": [
+        1.409810185432434,
+        0.9648144841194153,
+        0.5229770541191101
+      ],
+      "size_gltf": [
+        2.79392,
+        0.99481,
+        1.12173
+      ],
+      "ground_offset_y": 0.029999999329447746,
+      "triangles": 61902,
+      "primitives": 14,
+      "textures": 0
+    },
+    {
+      "id": "18_deciduous_tree",
+      "target": "Лиственные деревья (tint >= 2)",
+      "asset_path": "environment/reference_city_v1/glb/18_deciduous_tree.glb",
+      "scene": 0,
+      "sha256": "6bec44a1d34cf5a64e6db2fc6d8743ba2909867d143dc84828223f3e88426dce",
+      "bounds_gltf_min": [
+        -1.9727345705032349,
+        -0.007441604509949684,
+        -2.3244056701660156
+      ],
+      "bounds_gltf_max": [
+        2.3558239936828613,
+        4.530157089233398,
+        2.590888500213623
+      ],
+      "size_gltf": [
+        4.32856,
+        4.5376,
+        4.91529
+      ],
+      "ground_offset_y": 0.007441604509949684,
+      "triangles": 124764,
+      "primitives": 7,
+      "textures": 0
+    },
+    {
+      "id": "19_stone_iron_fence",
+      "target": "Декоративные ограды",
+      "asset_path": "environment/reference_city_v1/glb/19_stone_iron_fence.glb",
+      "scene": 0,
+      "sha256": "2f5de6cfe8b2bfda7d2aa7f584dccd41c5d09f0a6f2ef501b613b1039014b9f8",
+      "bounds_gltf_min": [
+        -1.5600000619888306,
+        0.008500000461935997,
+        -0.36000001430511475
+      ],
+      "bounds_gltf_max": [
+        1.5600000619888306,
+        1.8700000047683716,
+        0.36000001430511475
+      ],
+      "size_gltf": [
+        3.12,
+        1.8615,
+        0.72
+      ],
+      "ground_offset_y": -0.008500000461935997,
+      "triangles": 9020,
+      "primitives": 6,
+      "textures": 0
+    },
+    {
+      "id": "20_cobblestone_patch",
+      "target": "Образец мощения; не накладка всей поверхности",
+      "asset_path": "environment/reference_city_v1/glb/20_cobblestone_patch.glb",
+      "scene": 0,
+      "sha256": "7ab621f86b81c48bbf54f507525e1a17e9f4d2d800b51ae4309d10d84cc9430a",
+      "bounds_gltf_min": [
+        -1.399999976158142,
+        0,
+        -1.399999976158142
+      ],
+      "bounds_gltf_max": [
+        1.399999976158142,
+        0.17951731383800507,
+        1.399999976158142
+      ],
+      "size_gltf": [
+        2.8,
+        0.17952,
+        2.8
+      ],
+      "ground_offset_y": 0,
+      "triangles": 9288,
+      "primitives": 5,
+      "textures": 0
+    }
+  ]
+}

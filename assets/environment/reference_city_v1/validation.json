@@ -1,0 +1,175 @@
+{
+  "asset_count": 20,
+  "assets": [
+    {
+      "index": 1,
+      "file": "glb/01_gatehouse.glb",
+      "bytes": 16700552,
+      "mesh_count": 1,
+      "materials": 13,
+      "preview": "previews/01_gatehouse.png"
+    },
+    {
+      "index": 2,
+      "file": "glb/02_curtain_wall.glb",
+      "bytes": 1071472,
+      "mesh_count": 1,
+      "materials": 5,
+      "preview": "previews/02_curtain_wall.png"
+    },
+    {
+      "index": 3,
+      "file": "glb/03_watchtower.glb",
+      "bytes": 5076300,
+      "mesh_count": 1,
+      "materials": 11,
+      "preview": "previews/03_watchtower.png"
+    },
+    {
+      "index": 4,
+      "file": "glb/04_merchant_house.glb",
+      "bytes": 4393356,
+      "mesh_count": 1,
+      "materials": 28,
+      "preview": "previews/04_merchant_house.png"
+    },
+    {
+      "index": 5,
+      "file": "glb/05_small_house.glb",
+      "bytes": 2804896,
+      "mesh_count": 1,
+      "materials": 27,
+      "preview": "previews/05_small_house.png"
+    },
+    {
+      "index": 6,
+      "file": "glb/06_blacksmith_forge.glb",
+      "bytes": 2821724,
+      "mesh_count": 1,
+      "materials": 19,
+      "preview": "previews/06_blacksmith_forge.png"
+    },
+    {
+      "index": 7,
+      "file": "glb/07_anvil.glb",
+      "bytes": 231704,
+      "mesh_count": 1,
+      "materials": 5,
+      "preview": "previews/07_anvil.png"
+    },
+    {
+      "index": 8,
+      "file": "glb/08_blacksmith_sign.glb",
+      "bytes": 313880,
+      "mesh_count": 1,
+      "materials": 6,
+      "preview": "previews/08_blacksmith_sign.png"
+    },
+    {
+      "index": 9,
+      "file": "glb/09_fountain.glb",
+      "bytes": 2731776,
+      "mesh_count": 1,
+      "materials": 18,
+      "preview": "previews/09_fountain.png"
+    },
+    {
+      "index": 10,
+      "file": "glb/10_market_stall.glb",
+      "bytes": 2146632,
+      "mesh_count": 1,
+      "materials": 15,
+      "preview": "previews/10_market_stall.png"
+    },
+    {
+      "index": 11,
+      "file": "glb/11_street_lantern.glb",
+      "bytes": 165008,
+      "mesh_count": 1,
+      "materials": 3,
+      "preview": "previews/11_street_lantern.png"
+    },
+    {
+      "index": 12,
+      "file": "glb/12_wall_lantern.glb",
+      "bytes": 141984,
+      "mesh_count": 1,
+      "materials": 4,
+      "preview": "previews/12_wall_lantern.png"
+    },
+    {
+      "index": 13,
+      "file": "glb/13_royal_banner.glb",
+      "bytes": 1757852,
+      "mesh_count": 1,
+      "materials": 2,
+      "preview": "previews/13_royal_banner.png"
+    },
+    {
+      "index": 14,
+      "file": "glb/14_wooden_crates.glb",
+      "bytes": 900828,
+      "mesh_count": 1,
+      "materials": 7,
+      "preview": "previews/14_wooden_crates.png"
+    },
+    {
+      "index": 15,
+      "file": "glb/15_merchant_counter.glb",
+      "bytes": 1188876,
+      "mesh_count": 1,
+      "materials": 12,
+      "preview": "previews/15_merchant_counter.png"
+    },
+    {
+      "index": 16,
+      "file": "glb/16_square_flower_planter.glb",
+      "bytes": 1542764,
+      "mesh_count": 1,
+      "materials": 14,
+      "preview": "previews/16_square_flower_planter.png"
+    },
+    {
+      "index": 17,
+      "file": "glb/17_long_flower_planter.glb",
+      "bytes": 1989940,
+      "mesh_count": 1,
+      "materials": 14,
+      "preview": "previews/17_long_flower_planter.png"
+    },
+    {
+      "index": 18,
+      "file": "glb/18_deciduous_tree.glb",
+      "bytes": 7024264,
+      "mesh_count": 1,
+      "materials": 7,
+      "preview": "previews/18_deciduous_tree.png"
+    },
+    {
+      "index": 19,
+      "file": "glb/19_stone_iron_fence.glb",
+      "bytes": 308204,
+      "mesh_count": 1,
+      "materials": 6,
+      "preview": "previews/19_stone_iron_fence.png"
+    },
+    {
+      "index": 20,
+      "file": "glb/20_cobblestone_patch.glb",
+      "bytes": 505624,
+      "mesh_count": 1,
+      "materials": 5,
+      "preview": "previews/20_cobblestone_patch.png"
+    }
+  ],
+  "checks": [
+    "20 ordered assets",
+    "nonempty meshes",
+    "meter scale source transforms",
+    "GLB headers and embedded buffers",
+    "one mesh and one scene per GLB",
+    "material payloads",
+    "no exported cameras",
+    "individual and overview renders"
+  ]
+}

@@ -1,0 +1,239 @@
+{
+  "registration": {
+    "level": 1,
+    "currentExp": 0,
+    "exp": 100,
+    "hp": 100,
+    "mana": 100,
+    "stamina": 100,
+    "energy": 100,
+    "coins": 500,
+    "gold": 0,
+    "sp": 0,
+    "statPoint": 0,
+    "f_attack": 20,
+    "f_defence": 20,
+    "f_crit_power": 1.5,
+    "f_crit_chance": 0.1,
+    "f_accuracy": 50,
+    "f_evasion": 50,
+    "f_attack_speed": 50,
+    "m_attack": 20,
+    "m_defence": 20,
+    "m_crit_power": 1.5,
+    "m_crit_chance": 0.1,
+    "m_accuracy": 50,
+    "m_evasion": 50,
+    "m_attack_speed": 50,
+    "speed": 100,
+    "initiative": 20,
+    "location": 1,
+    "sublocation": 1
+  },
+  "baseStats": {
+    "1_1": {
+      "STR": 14,
+      "DEX": 13,
+      "CON": 12,
+      "INT": 8,
+      "WIT": 6,
+      "MEN": 8,
+      "LUC": 12
+    },
+    "1_2": {
+      "STR": 8,
+      "DEX": 8,
+      "CON": 7,
+      "INT": 14,
+      "WIT": 13,
+      "MEN": 12,
+      "LUC": 11
+    },
+    "2_1": {
+      "STR": 12,
+      "DEX": 15,
+      "CON": 13,
+      "INT": 7,
+      "WIT": 8,
+      "MEN": 7,
+      "LUC": 11
+    },
+    "2_2": {
+      "STR": 7,
+      "DEX": 10,
+      "CON": 6,
+      "INT": 13,
+      "WIT": 15,
+      "MEN": 12,
+      "LUC": 11
+    },
+    "3_1": {
+      "STR": 15,
+      "DEX": 12,
+      "CON": 11,
+      "INT": 7,
+      "WIT": 8,
+      "MEN": 7,
+      "LUC": 13
+    },
+    "3_2": {
+      "STR": 9,
+      "DEX": 6,
+      "CON": 7,
+      "INT": 15,
+      "WIT": 12,
+      "MEN": 12,
+      "LUC": 13
+    },
+    "4_1": {
+      "STR": 14,
+      "DEX": 11,
+      "CON": 15,
+      "INT": 6,
+      "WIT": 8,
+      "MEN": 7,
+      "LUC": 12
+    },
+    "4_2": {
+      "STR": 8,
+      "DEX": 6,
+      "CON": 6,
+      "INT": 14,
+      "WIT": 11,
+      "MEN": 15,
+      "LUC": 12
+    },
+    "5_1": {
+      "STR": 13,
+      "DEX": 11,
+      "CON": 14,
+      "INT": 6,
+      "WIT": 6,
+      "MEN": 7,
+      "LUC": 15
+    },
+    "5_2": {
+      "STR": 8,
+      "DEX": 7,
+      "CON": 8,
+      "INT": 12,
+      "WIT": 12,
+      "MEN": 12,
+      "LUC": 15
+    },
+    "6_1": {
+      "STR": 14,
+      "DEX": 14,
+      "CON": 11,
+      "INT": 8,
+      "WIT": 7,
+      "MEN": 7,
+      "LUC": 14
+    },
+    "6_2": {
+      "STR": 8,
+      "DEX": 7,
+      "CON": 6,
+      "INT": 14,
+      "WIT": 14,
+      "MEN": 11,
+      "LUC": 14
+    }
+  },
+  "statNeutral": 10,
+  "statInfluence": {
+    "STR": {
+      "f_attack": {
+        "bonusPerUnit": 2,
+        "penaltyPerUnit": 2
+      },
+      "f_crit_power": {
+        "bonusPerUnit": 0.02,
+        "penaltyPerUnit": 0.01
+      }
+    },
+    "DEX": {
+      "f_crit_chance": {
+        "bonusPerUnit": 0.005,
+        "penaltyPerUnit": 0.003
+      },
+      "f_accuracy": {
+        "bonusPerUnit": 2,
+        "penaltyPerUnit": 2
+      },
+      "f_evasion": {
+        "bonusPerUnit": 2,
+        "penaltyPerUnit": 2
+      },
+      "f_attack_speed": {
+        "bonusPerUnit": 2,
+        "penaltyPerUnit": 2
+      },
+      "speed": {
+        "bonusPerUnit": 3,
+        "penaltyPerUnit": 3
+      },
+      "initiative": {
+        "bonusPerUnit": 1,
+        "penaltyPerUnit": 1
+      },
+      "stamina": {
+        "bonusPerUnit": 5,
+        "penaltyPerUnit": 3
+      }
+    },
+    "CON": {
+      "f_defence": {
+        "bonusPerUnit": 2,
+        "penaltyPerUnit": 2
+      },
+      "hp": {
+        "bonusPerUnit": 10,
+        "penaltyPerUnit": 5
+      }
+    },
+    "INT": {
+      "m_attack": {
+        "bonusPerUnit": 2,
+        "penaltyPerUnit": 2
+      },
+      "m_crit_power": {
+        "bonusPerUnit": 0.02,
+        "penaltyPerUnit": 0.01
+      }
+    },
+    "WIT": {
+      "m_crit_chance": {
+        "bonusPerUnit": 0.005,
+        "penaltyPerUnit": 0.003
+      },
+      "m_accuracy": {
+        "bonusPerUnit": 2,
+        "penaltyPerUnit": 2
+      },
+      "m_evasion": {
+        "bonusPerUnit": 2,
+        "penaltyPerUnit": 2
+      },
+      "m_attack_speed": {
+        "bonusPerUnit": 2,
+        "penaltyPerUnit": 2
+      }
+    },
+    "MEN": {
+      "m_defence": {
+        "bonusPerUnit": 2,
+        "penaltyPerUnit": 2
+      },
+      "mana": {
+        "bonusPerUnit": 10,
+        "penaltyPerUnit": 5
+      }
+    }
+  },
+  "crit": {
+    "minChance": 0.03,
+    "maxChance": 0.8,
+    "defaultPower": 1.5
+  }
+}

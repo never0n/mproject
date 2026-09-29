@@ -1,0 +1,19 @@
+name: mortown
+services:
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: mortown
+      POSTGRES_PASSWORD: mortown_local_dev
+      POSTGRES_DB: mortown
+    ports:
+      - "127.0.0.1:55432:5432"
+    volumes:
+      - mortown_pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mortown -d mortown"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+volumes:
+  mortown_pg:

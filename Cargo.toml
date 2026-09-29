@@ -1,0 +1,15 @@
+[workspace]
+members = ["crates/world", "crates/client", "crates/protocol", "crates/server"]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.90"
+version = "0.1.0"
+
+[profile.dev]
+opt-level = 1
+debug = 0
+
+[profile.dev.package."*"]
+opt-level = 2

@@ -1,0 +1,322 @@
+[
+  {
+    "index": 1,
+    "id": "01_gatehouse",
+    "name_ru": "Крепостные ворота",
+    "size_meters": [
+      10.359,
+      2.759,
+      11.6
+    ],
+    "vertices": 44114,
+    "faces": 35032,
+    "blend": "blend/01_gatehouse.blend",
+    "glb": "glb/01_gatehouse.glb",
+    "preview": "previews/01_gatehouse.png",
+    "triangles": 71192
+  },
+  {
+    "index": 2,
+    "id": "02_curtain_wall",
+    "name_ru": "Крепостная стена",
+    "size_meters": [
+      7.0,
+      1.533,
+      4.116
+    ],
+    "vertices": 1464,
+    "faces": 1098,
+    "blend": "blend/02_curtain_wall.blend",
+    "glb": "glb/02_curtain_wall.glb",
+    "preview": "previews/02_curtain_wall.png",
+    "triangles": 2196
+  },
+  {
+    "index": 3,
+    "id": "03_watchtower",
+    "name_ru": "Сторожевая башня",
+    "size_meters": [
+      2.441,
+      2.441,
+      10.0
+    ],
+    "vertices": 10534,
+    "faces": 7712,
+    "blend": "blend/03_watchtower.blend",
+    "glb": "glb/03_watchtower.glb",
+    "preview": "previews/03_watchtower.png",
+    "triangles": 15540
+  },
+  {
+    "index": 4,
+    "id": "04_merchant_house",
+    "name_ru": "Дом торговца",
+    "size_meters": [
+      5.53,
+      5.295,
+      7.415
+    ],
+    "vertices": 9970,
+    "faces": 7666,
+    "blend": "blend/04_merchant_house.blend",
+    "glb": "glb/04_merchant_house.glb",
+    "preview": "previews/04_merchant_house.png",
+    "triangles": 12832
+  },
+  {
+    "index": 5,
+    "id": "05_small_house",
+    "name_ru": "Малый фахверковый дом",
+    "size_meters": [
+      4.23,
+      4.555,
+      5.465
+    ],
+    "vertices": 6158,
+    "faces": 4672,
+    "blend": "blend/05_small_house.blend",
+    "glb": "glb/05_small_house.glb",
+    "preview": "previews/05_small_house.png",
+    "triangles": 7980
+  },
+  {
+    "index": 6,
+    "id": "06_blacksmith_forge",
+    "name_ru": "Кузница",
+    "size_meters": [
+      4.63,
+      3.209,
+      4.883
+    ],
+    "vertices": 6610,
+    "faces": 5368,
+    "blend": "blend/06_blacksmith_forge.blend",
+    "glb": "glb/06_blacksmith_forge.glb",
+    "preview": "previews/06_blacksmith_forge.png",
+    "triangles": 10176
+  },
+  {
+    "index": 7,
+    "id": "07_anvil",
+    "name_ru": "Наковальня",
+    "size_meters": [
+      1.474,
+      0.991,
+      1.511
+    ],
+    "vertices": 1900,
+    "faces": 1446,
+    "blend": "blend/07_anvil.blend",
+    "glb": "glb/07_anvil.glb",
+    "preview": "previews/07_anvil.png",
+    "triangles": 2832
+  },
+  {
+    "index": 8,
+    "id": "08_blacksmith_sign",
+    "name_ru": "Вывеска кузнеца",
+    "size_meters": [
+      1.665,
+      0.328,
+      2.8
+    ],
+    "vertices": 3360,
+    "faces": 1248,
+    "blend": "blend/08_blacksmith_sign.blend",
+    "glb": "glb/08_blacksmith_sign.glb",
+    "preview": "previews/08_blacksmith_sign.png",
+    "triangles": 3180
+  },
+  {
+    "index": 9,
+    "id": "09_fountain",
+    "name_ru": "Фонтан",
+    "size_meters": [
+      4.7,
+      4.7,
+      3.87
+    ],
+    "vertices": 27608,
+    "faces": 14242,
+    "blend": "blend/09_fountain.blend",
+    "glb": "glb/09_fountain.glb",
+    "preview": "previews/09_fountain.png",
+    "triangles": 28908
+  },
+  {
+    "index": 10,
+    "id": "10_market_stall",
+    "name_ru": "Рыночный прилавок с навесом",
+    "size_meters": [
+      3.674,
+      2.154,
+      3.0
+    ],
+    "vertices": 17016,
+    "faces": 14660,
+    "blend": "blend/10_market_stall.blend",
+    "glb": "glb/10_market_stall.glb",
+    "preview": "previews/10_market_stall.png",
+    "triangles": 28816
+  },
+  {
+    "index": 11,
+    "id": "11_street_lantern",
+    "name_ru": "Уличный фонарь",
+    "size_meters": [
+      0.703,
+      0.703,
+      3.796
+    ],
+    "vertices": 800,
+    "faces": 680,
+    "blend": "blend/11_street_lantern.blend",
+    "glb": "glb/11_street_lantern.glb",
+    "preview": "previews/11_street_lantern.png",
+    "triangles": 1340
+  },
+  {
+    "index": 12,
+    "id": "12_wall_lantern",
+    "name_ru": "Настенный фонарь",
+    "size_meters": [
+      0.642,
+      1.301,
+      1.66
+    ],
+    "vertices": 564,
+    "faces": 398,
+    "blend": "blend/12_wall_lantern.blend",
+    "glb": "glb/12_wall_lantern.glb",
+    "preview": "previews/12_wall_lantern.png",
+    "triangles": 784
+  },
+  {
+    "index": 13,
+    "id": "13_royal_banner",
+    "name_ru": "Королевское знамя",
+    "size_meters": [
+      2.083,
+      0.234,
+      3.013
+    ],
+    "vertices": 9787,
+    "faces": 8600,
+    "blend": "blend/13_royal_banner.blend",
+    "glb": "glb/13_royal_banner.glb",
+    "preview": "previews/13_royal_banner.png",
+    "triangles": 17592
+  },
+  {
+    "index": 14,
+    "id": "14_wooden_crates",
+    "name_ru": "Деревянные ящики",
+    "size_meters": [
+      2.105,
+      1.097,
+      1.661
+    ],
+    "vertices": 1632,
+    "faces": 1524,
+    "blend": "blend/14_wooden_crates.blend",
+    "glb": "glb/14_wooden_crates.glb",
+    "preview": "previews/14_wooden_crates.png",
+    "triangles": 2664
+  },
+  {
+    "index": 15,
+    "id": "15_merchant_counter",
+    "name_ru": "Торговый прилавок",
+    "size_meters": [
+      3.169,
+      1.065,
+      1.524
+    ],
+    "vertices": 8136,
+    "faces": 7058,
+    "blend": "blend/15_merchant_counter.blend",
+    "glb": "glb/15_merchant_counter.glb",
+    "preview": "previews/15_merchant_counter.png",
+    "triangles": 13348
+  },
+  {
+    "index": 16,
+    "id": "16_square_flower_planter",
+    "name_ru": "Квадратная клумба",
+    "size_meters": [
+      1.401,
+      1.534,
+      1.285
+    ],
+    "vertices": 7968,
+    "faces": 5866,
+    "blend": "blend/16_square_flower_planter.blend",
+    "glb": "glb/16_square_flower_planter.glb",
+    "preview": "previews/16_square_flower_planter.png",
+    "triangles": 8104
+  },
+  {
+    "index": 17,
+    "id": "17_long_flower_planter",
+    "name_ru": "Длинная клумба",
+    "size_meters": [
+      2.794,
+      1.122,
+      0.995
+    ],
+    "vertices": 10668,
+    "faces": 7816,
+    "blend": "blend/17_long_flower_planter.blend",
+    "glb": "glb/17_long_flower_planter.glb",
+    "preview": "previews/17_long_flower_planter.png",
+    "triangles": 10754
+  },
+  {
+    "index": 18,
+    "id": "18_deciduous_tree",
+    "name_ru": "Лиственное дерево",
+    "size_meters": [
+      4.329,
+      4.915,
+      4.538
+    ],
+    "vertices": 24232,
+    "faces": 18046,
+    "blend": "blend/18_deciduous_tree.blend",
+    "glb": "glb/18_deciduous_tree.glb",
+    "preview": "previews/18_deciduous_tree.png",
+    "triangles": 19724
+  },
+  {
+    "index": 19,
+    "id": "19_stone_iron_fence",
+    "name_ru": "Каменная ограда",
+    "size_meters": [
+      3.12,
+      0.72,
+      1.862
+    ],
+    "vertices": 1034,
+    "faces": 714,
+    "blend": "blend/19_stone_iron_fence.blend",
+    "glb": "glb/19_stone_iron_fence.glb",
+    "preview": "previews/19_stone_iron_fence.png",
+    "triangles": 1356
+  },
+  {
+    "index": 20,
+    "id": "20_cobblestone_patch",
+    "name_ru": "Брусчатка",
+    "size_meters": [
+      2.8,
+      2.8,
+      0.18
+    ],
+    "vertices": 688,
+    "faces": 516,
+    "blend": "blend/20_cobblestone_patch.blend",
+    "glb": "glb/20_cobblestone_patch.glb",
+    "preview": "previews/20_cobblestone_patch.png",
+    "triangles": 1032
+  }
+]

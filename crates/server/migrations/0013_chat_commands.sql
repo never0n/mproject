@@ -1,0 +1,16 @@
+ALTER TABLE accounts ADD COLUMN role SMALLINT NOT NULL DEFAULT 1 CHECK(role BETWEEN 1 AND 8);
+ALTER TABLE accounts ADD COLUMN banned_until TIMESTAMPTZ;
+ALTER TABLE accounts ADD COLUMN ban_reason TEXT NOT NULL DEFAULT '';
+ALTER TABLE accounts ADD COLUMN session_epoch BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE accounts ADD COLUMN last_ip INET;
+CREATE TABLE blocked_ips(ip INET PRIMARY KEY, created_at TIMESTAMPTZ NOT NULL DEFAULT now());
+CREATE TABLE global_mutes(character_id BIGINT PRIMARY KEY REFERENCES characters(id) ON DELETE CASCADE, until_at TIMESTAMPTZ NOT NULL);
+CREATE TABLE chat_preferences(character_id BIGINT PRIMARY KEY REFERENCES characters(id) ON DELETE CASCADE, ignore_all BOOLEAN NOT NULL DEFAULT false, silence BOOLEAN NOT NULL DEFAULT false);
+CREATE TABLE admin_audit(id BIGSERIAL PRIMARY KEY, actor_id BIGINT NOT NULL, action TEXT NOT NULL, target TEXT NOT NULL, detail TEXT NOT NULL DEFAULT '', created_at TIMESTAMPTZ NOT NULL DEFAULT now());
+ALTER TABLE chat_messages DROP CONSTRAINT chat_messages_channel_check;
+ALTER TABLE chat_messages ADD CONSTRAINT chat_messages_channel_check CHECK(channel IN ('general','local','group','alliance','private'));
+ALTER TABLE chat_messages ADD COLUMN recipient_id BIGINT REFERENCES characters(id);
+ALTER TABLE chat_messages ADD CONSTRAINT chat_private_audience CHECK((channel='private')=(recipient_id IS NOT NULL));
+ALTER TABLE alliance_storage_events ALTER COLUMN character_id DROP NOT NULL;
+ALTER TABLE alliance_storage_events DROP CONSTRAINT alliance_storage_events_character_id_fkey;
+ALTER TABLE alliance_storage_events ADD CONSTRAINT alliance_storage_events_character_id_fkey FOREIGN KEY(character_id) REFERENCES characters(id) ON DELETE SET NULL;

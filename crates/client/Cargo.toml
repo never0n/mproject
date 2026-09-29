@@ -1,0 +1,21 @@
+[package]
+name = "mortown-client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+mortown-protocol = { path = "../protocol" }
+serde_json = "1"
+tokio = { version = "1", features = ["rt", "net", "sync", "time", "macros"] }
+tokio-tungstenite = "0.28"
+futures-util = "0.3"
+mortown-world = { path = "../world" }
+bevy = { version = "=0.18.1", default-features = false, features = [
+    "std", "reflect_auto_register", "async_executor", "multi_threaded", "bevy_asset", "bevy_log",
+    "bevy_winit", "x11", "wayland", "bevy_window", "bevy_camera",
+    "bevy_render", "bevy_core_pipeline", "bevy_pbr", "bevy_light",
+    "bevy_mesh", "bevy_color", "bevy_image", "bevy_shader",
+    "bevy_ui", "bevy_ui_render", "bevy_text", "default_font", "png", "jpeg", "bevy_gltf", "bevy_scene", "bevy_animation", "gltf_animation",
+] }
+

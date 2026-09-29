@@ -1,0 +1,26 @@
+# Rust build output
+/target/
+
+# Local screenshots, logs and database dumps
+/artifacts/
+/.local/
+*.log
+
+# Secrets
+.env
+.env.*
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Blender autosave backups
+*.blend[0-9]
+
+# Editors and OS
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store
+Thumbs.db

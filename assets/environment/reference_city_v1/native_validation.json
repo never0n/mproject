@@ -1,0 +1,142 @@
+[
+  {
+    "index": 1,
+    "blend": "blend/01_gatehouse.blend",
+    "active_scene": "01_gatehouse | Крепостные ворота",
+    "meshes": 1,
+    "vertices": 44114
+  },
+  {
+    "index": 2,
+    "blend": "blend/02_curtain_wall.blend",
+    "active_scene": "02_curtain_wall | Крепостная стена",
+    "meshes": 1,
+    "vertices": 1464
+  },
+  {
+    "index": 3,
+    "blend": "blend/03_watchtower.blend",
+    "active_scene": "03_watchtower | Сторожевая башня",
+    "meshes": 1,
+    "vertices": 10534
+  },
+  {
+    "index": 4,
+    "blend": "blend/04_merchant_house.blend",
+    "active_scene": "04_merchant_house | Дом торговца",
+    "meshes": 1,
+    "vertices": 9970
+  },
+  {
+    "index": 5,
+    "blend": "blend/05_small_house.blend",
+    "active_scene": "05_small_house | Малый фахверковый дом",
+    "meshes": 1,
+    "vertices": 6158
+  },
+  {
+    "index": 6,
+    "blend": "blend/06_blacksmith_forge.blend",
+    "active_scene": "06_blacksmith_forge | Кузница",
+    "meshes": 1,
+    "vertices": 6610
+  },
+  {
+    "index": 7,
+    "blend": "blend/07_anvil.blend",
+    "active_scene": "07_anvil | Наковальня",
+    "meshes": 1,
+    "vertices": 1900
+  },
+  {
+    "index": 8,
+    "blend": "blend/08_blacksmith_sign.blend",
+    "active_scene": "08_blacksmith_sign | Вывеска кузнеца",
+    "meshes": 1,
+    "vertices": 3360
+  },
+  {
+    "index": 9,
+    "blend": "blend/09_fountain.blend",
+    "active_scene": "09_fountain | Фонтан",
+    "meshes": 1,
+    "vertices": 27608
+  },
+  {
+    "index": 10,
+    "blend": "blend/10_market_stall.blend",
+    "active_scene": "10_market_stall | Рыночный прилавок с наве",
+    "meshes": 1,
+    "vertices": 17016
+  },
+  {
+    "index": 11,
+    "blend": "blend/11_street_lantern.blend",
+    "active_scene": "11_street_lantern | Уличный фонарь",
+    "meshes": 1,
+    "vertices": 800
+  },
+  {
+    "index": 12,
+    "blend": "blend/12_wall_lantern.blend",
+    "active_scene": "12_wall_lantern | Настенный фонарь",
+    "meshes": 1,
+    "vertices": 564
+  },
+  {
+    "index": 13,
+    "blend": "blend/13_royal_banner.blend",
+    "active_scene": "13_royal_banner | Королевское знамя",
+    "meshes": 1,
+    "vertices": 9787
+  },
+  {
+    "index": 14,
+    "blend": "blend/14_wooden_crates.blend",
+    "active_scene": "14_wooden_crates | Деревянные ящики",
+    "meshes": 1,
+    "vertices": 1632
+  },
+  {
+    "index": 15,
+    "blend": "blend/15_merchant_counter.blend",
+    "active_scene": "15_merchant_counter | Торговый прилавок",
+    "meshes": 1,
+    "vertices": 8136
+  },
+  {
+    "index": 16,
+    "blend": "blend/16_square_flower_planter.blend",
+    "active_scene": "16_square_flower_planter | Квадратная клумба",
+    "meshes": 1,
+    "vertices": 7968
+  },
+  {
+    "index": 17,
+    "blend": "blend/17_long_flower_planter.blend",
+    "active_scene": "17_long_flower_planter | Длинная клумба",
+    "meshes": 1,
+    "vertices": 10668
+  },
+  {
+    "index": 18,
+    "blend": "blend/18_deciduous_tree.blend",
+    "active_scene": "18_deciduous_tree | Лиственное дерево",
+    "meshes": 1,
+    "vertices": 24232
+  },
+  {
+    "index": 19,
+    "blend": "blend/19_stone_iron_fence.blend",
+    "active_scene": "19_stone_iron_fence | Каменная ограда",
+    "meshes": 1,
+    "vertices": 1034
+  },
+  {
+    "index": 20,
+    "blend": "blend/20_cobblestone_patch.blend",
+    "active_scene": "20_cobblestone_patch | Брусчатка",
+    "meshes": 1,
+    "vertices": 688
+  }
+]
