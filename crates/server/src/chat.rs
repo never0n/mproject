@@ -88,18 +88,32 @@ pub async fn handle(
                 let (nickname,mut recipients,party)={
                     let sim=server.simulation.lock().await;
                     let actor=sim.actor(owner).ok_or("Персонаж не в мире")?;
+                    let world=sim.terrain();
+                    let from=[actor.position[0],actor.position[2]];
+                    let hear=|other:&mortown_protocol::Actor| {
+                        let at=[other.position[0],other.position[2]];
+                        other.id==owner || (mortown_world::distance(from,at)<=chat::LOCAL_RADIUS && world.segment_clear(from,at))
+                    };
                     let party=if channel==Channel::Group{Some(sim.parties.membership(owner).ok_or("Вы не состоите в группе")?)}else{None};
                     let recipients=if let Some((id,_))=&recipient {
-                        if sim.actor(*id).is_none(){return Err("Персонаж сейчас не в игре".into());}vec![owner,*id]
-                    }else if channel==Channel::Group{sim.parties.members(owner).unwrap()}else{sim.snapshot().iter().filter(|a|channel==Channel::General||mortown_world::distance([a.position[0],a.position[2]],[actor.position[0],actor.position[2]])<=chat::LOCAL_RADIUS).map(|a|a.id).collect()};
-                    (actor.nickname,recipients,party)
+                        let other=sim.actor(*id).ok_or("Персонаж сейчас не в игре")?;
+                        if !hear(&other){return Err("Слишком далеко или путь закрыт. Для письма нужна птица".into());}
+                        vec![owner,*id]
+                    }else if channel==Channel::Group{
+                        sim.parties.members(owner).unwrap().into_iter().filter(|id| sim.actor(*id).is_some_and(|other| hear(&other))).collect()
+                    }else{
+                        sim.snapshot().into_iter().filter(|other| hear(other)).map(|other| other.id).collect()
+                    };
+                    (mortown_protocol::society::public_label(&actor.presented, actor.face_hidden, None),recipients,party)
                 };
                 let mut tx=conn.begin().await.map_err(unavailable)?;
                 let alliance=if channel==Channel::Alliance {
                     sqlx::query("SET LOCAL lock_timeout = '3s'").execute(&mut *tx).await.map_err(unavailable)?;
                     sqlx::query("SELECT pg_advisory_xact_lock($1)").bind(crate::alliance::LOCK).execute(&mut *tx).await.map_err(unavailable)?;
                     let (id,members)=crate::alliance::audience(&mut tx,owner).await?;
-                    recipients=members;Some(id)
+                    recipients.retain(|member| members.contains(member));
+                    if !recipients.contains(&owner){recipients.push(owner);}
+                    Some(id)
                 } else {None};
                 let account:i64=sqlx::query_scalar("SELECT account_id FROM characters WHERE id=$1").bind(owner).fetch_one(&mut *tx).await.map_err(unavailable)?;
                 sqlx::query("SELECT id FROM accounts WHERE id=$1 FOR NO KEY UPDATE").bind(account).fetch_one(&mut *tx).await.map_err(unavailable)?;

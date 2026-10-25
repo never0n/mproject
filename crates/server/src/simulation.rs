@@ -9,37 +9,29 @@ struct Adventurer {
     walking: bool,
     seq: u64,
     last_input: u64,
+    offline_age: u64,
 }
 #[derive(Resource)]
 struct Terrain(Arc<mortown_world::World>);
 #[derive(Resource, Default)]
 struct Tick(u64);
+#[derive(Resource, Default, Clone)]
+pub struct Blocks(pub Vec<mortown_protocol::work::Block>);
 pub struct Simulation {
     pub parties: crate::party::Parties,
     pub exchanges: crate::exchange::Exchanges,
     world: World,
     schedule: Schedule,
     entities: HashMap<i64, Entity>,
-    pub residents: Vec<mortown_protocol::admin::NpcState>,
-    pub next_npc: u16,
     pub combat: crate::combat::Combat,
 }
 impl Simulation {
     pub fn new(terrain: Arc<mortown_world::World>) -> Self {
         let combat = crate::combat::Combat::new(&terrain);
-        let residents = mortown_world::npcs::RESIDENTS
-            .iter()
-            .map(|n| mortown_protocol::admin::NpcState {
-                id: n.id,
-                template: n.id,
-                position: n.feet(&terrain),
-                yaw: n.yaw(),
-                hp: 100.,
-            })
-            .collect();
         let mut world = World::new();
         world.insert_resource(Terrain(terrain));
         world.init_resource::<Tick>();
+        world.init_resource::<Blocks>();
         let mut schedule = Schedule::default();
         schedule.set_executor_kind(bevy_ecs::schedule::ExecutorKind::SingleThreaded);
         schedule.add_systems(advance);
@@ -49,18 +41,11 @@ impl Simulation {
             world,
             schedule,
             entities: HashMap::new(),
-            residents,
-            next_npc: 8,
             combat,
         }
     }
-    pub fn resident(&self, id: u8) -> Option<mortown_world::npcs::Npc> {
-        let state = self.residents.iter().find(|n| n.id == id && n.hp > 0.)?;
-        Some(mortown_world::npcs::definition(state.template)?.at(
-            state.id,
-            state.position,
-            state.yaw,
-        ))
+    pub fn set_blocks(&mut self, blocks: Vec<mortown_protocol::work::Block>) {
+        self.world.insert_resource(Blocks(blocks));
     }
     pub fn teleport(&mut self, id: i64, p: [f32; 3]) -> Result<(), &'static str> {
         if !p.iter().all(|n| n.is_finite()) || !self.terrain().walkable(p[0], p[2]) {
@@ -104,14 +89,49 @@ impl Simulation {
         yaw: f32,
     ) -> Result<Actor, &'static str> {
         if self.entities.contains_key(&id) {
-            return Err("Этот персонаж уже в игре");
+            let mut actor = self.actor(id).unwrap();
+            if !actor.offline {
+                return Err("Этот персонаж уже в игре");
+            }
+            actor.offline = false;
+            let feet = [actor.position[0], actor.position[2]];
+            let entity = self.entities[&id];
+            let mut body = self.world.get_mut::<Adventurer>(entity).unwrap();
+            body.actor = actor.clone();
+            // The client starts its move counter again. The previous session's counter
+            // would reject the first step and drop the connection.
+            body.seq = 0;
+            body.target = feet;
+            body.walking = false;
+            body.last_input = 0;
+            body.offline_age = 0;
+            return Ok(actor);
         }
         if self.entities.len() >= 64 {
             return Err("Сервер прототипа заполнен");
         }
         let world = &self.world.resource::<Terrain>().0;
         if !world.walkable(pos[0], pos[1]) {
-            pos = mortown_world::SPAWN;
+            // [PROPOSAL] A blocked saved cell moves to the nearest walkable cell within 6 m,
+            // not across the city. Spawn is only the last resort.
+            let mut found = None;
+            for ring in 1..12 {
+                for step in 0..16 {
+                    let angle = step as f32 * std::f32::consts::TAU / 16.;
+                    let candidate = [
+                        pos[0] + angle.cos() * ring as f32 * 0.5,
+                        pos[1] + angle.sin() * ring as f32 * 0.5,
+                    ];
+                    if world.walkable(candidate[0], candidate[1]) {
+                        found = Some(candidate);
+                        break;
+                    }
+                }
+                if found.is_some() {
+                    break;
+                }
+            }
+            pos = found.unwrap_or(mortown_world::SPAWN);
         }
         let occupied = |point: [f32; 2]| {
             self.entities.values().any(|entity| {
@@ -157,7 +177,21 @@ impl Simulation {
             progress: mortown_protocol::progression::Progress::from_stats(&Default::default()),
             powers: Default::default(),
             reward_status: String::new(),
-            loot: Default::default(),
+            downed: false,
+            bound: false,
+            offline: false,
+            lives: mortown_protocol::life::lives(),
+            return_seconds: 0,
+            death_mark: 0,
+            pending_death: false,
+            orders: mortown_protocol::life::Orders::default(),
+            post: pos,
+            return_until: 0,
+            hunger: 0.,
+            thirst: 0.,
+            presented: String::new(),
+            face_hidden: false,
+            identity: 1.,
         };
         let entity = self
             .world
@@ -167,6 +201,7 @@ impl Simulation {
                 walking: false,
                 seq: 0,
                 last_input: 0,
+                offline_age: 0,
             })
             .id();
         self.entities.insert(id, entity);
@@ -210,6 +245,10 @@ impl Simulation {
             self.world.get_mut::<Adventurer>(entity).unwrap().actor = actor;
         }
     }
+    /// Drops and coins earned since the last call, to be stored as stacks by the owner's session.
+    pub fn take_grants(&mut self, id: i64) -> Vec<(u8, u32)> {
+        self.combat.grants.remove(&id).unwrap_or_default()
+    }
     pub fn tick(&self) -> u64 {
         self.world.resource::<Tick>().0
     }
@@ -246,8 +285,7 @@ impl Simulation {
                 .get_mut::<Adventurer>(*entity)
                 .unwrap()
                 .actor
-                .equipment =
-                mortown_protocol::items::EquipmentAppearance::from_inventory(&c.inventory);
+                .equipment = mortown_protocol::items::EquipmentAppearance::from_items(&c.items);
         }
     }
     pub fn attack(&mut self, id: i64, target: Option<u32>) -> Result<(), &'static str> {
@@ -321,6 +359,20 @@ impl Simulation {
     pub fn areas(&self) -> Vec<mortown_protocol::skills::Area> {
         self.combat.areas(self.tick())
     }
+    /// Puts the body at `at` and keeps it there. Used when a test must stand on a source.
+    pub fn pin(&mut self, id: i64, at: [f32; 2]) {
+        let tick = self.tick();
+        let height = self
+            .world
+            .resource::<Terrain>()
+            .0
+            .surface_height(at[0], at[1]);
+        let entity = self.entities[&id];
+        let mut body = self.world.get_mut::<Adventurer>(entity).unwrap();
+        body.actor.position = [at[0], height, at[1]];
+        body.target = at;
+        body.last_input = tick;
+    }
     pub fn replace_actor(&mut self, actor: Actor) {
         if let Some(entity) = self.entities.get(&actor.id) {
             self.world.get_mut::<Adventurer>(*entity).unwrap().actor = actor;
@@ -335,18 +387,118 @@ impl Simulation {
     }
     pub fn respawn(&mut self, id: i64) -> Result<(), &'static str> {
         let mut actor = self.actor(id).ok_or("Персонаж не найден")?;
-        let terrain = self.world.resource::<Terrain>().0.clone();
-        self.combat.respawn(&mut actor, &terrain, self.tick())?;
+        self.combat.respawn(&mut actor, self.tick())?;
         let mut p = self
             .world
             .get_mut::<Adventurer>(self.entities[&id])
             .unwrap();
-        p.target = mortown_world::SPAWN;
         p.actor = actor;
         Ok(())
     }
     pub fn monsters(&self) -> Vec<mortown_protocol::Monster> {
         self.combat.mobs.iter().map(|m| m.view.clone()).collect()
+    }
+    /// The connection ended. The same body stays, now under offline orders.
+    pub fn disconnect(&mut self, id: i64) {
+        if let Some(actor) = self.actor(id) {
+            self.parties.disconnect(&actor);
+        }
+        let tick = self.tick();
+        let Some(entity) = self.entities.get(&id).copied() else {
+            return;
+        };
+        if let Some(mut body) = self.world.get_mut::<Adventurer>(entity) {
+            body.actor.offline = true;
+            body.actor.post = [body.actor.position[0], body.actor.position[2]];
+            body.target = body.actor.post;
+            body.last_input = tick;
+            body.offline_age = 0;
+        }
+    }
+    pub fn still_offline(&self, id: i64) -> bool {
+        self.actor(id).is_some_and(|actor| actor.offline)
+    }
+    pub fn expired_offline(&self) -> Vec<Actor> {
+        let limit = mortown_protocol::life::offline_ticks();
+        self.entities
+            .iter()
+            .filter_map(|(_, entity)| {
+                self.world.get::<Adventurer>(*entity).and_then(|body| {
+                    (body.actor.offline && body.offline_age >= limit).then(|| body.actor.clone())
+                })
+            })
+            .collect()
+    }
+    pub fn finish_death(&mut self, sheet: &mortown_protocol::Character) {
+        if !self.entities.contains_key(&sheet.id) {
+            return;
+        }
+        self.exchanges
+            .cancel(sheet.id, "Обмен отменён: один из участников умер");
+        self.configure(sheet);
+        let point = mortown_world::SPAWN;
+        let height = self
+            .world
+            .resource::<Terrain>()
+            .0
+            .surface_height(point[0], point[1]);
+        let Some(entity) = self.entities.get(&sheet.id).copied() else {
+            return;
+        };
+        let Some(mut body) = self.world.get_mut::<Adventurer>(entity) else {
+            return;
+        };
+        if sheet.stats.get("ended").copied() == Some(1.) {
+            body.actor.combat_status = "Жизни этого человека закончились.".into();
+            return;
+        }
+        body.actor.position = [point[0], height, point[1]];
+        body.target = point;
+        body.actor.return_until = sheet.stats.get("return_until").copied().unwrap_or(0.) as u64;
+        body.actor.identity = sheet.stats.get("identity").copied().unwrap_or(1.);
+        body.actor.presented.clear();
+        body.actor.face_hidden = false;
+        body.actor.combat_status = "Новая личность. Пока нельзя покинуть это место.".into();
+    }
+    pub fn mark_pending(&mut self, id: i64) {
+        let Some(entity) = self.entities.get(&id).copied() else {
+            return;
+        };
+        if let Some(mut body) = self.world.get_mut::<Adventurer>(entity) {
+            body.actor.pending_death = true;
+        }
+    }
+    /// Drops an offline body. An online character is left alone.
+    pub fn retire_offline(&mut self, ids: &[i64]) {
+        let gone: Vec<i64> = ids
+            .iter()
+            .copied()
+            .filter(|id| self.actor(*id).is_some_and(|actor| actor.offline))
+            .collect();
+        for id in gone {
+            self.leave(id);
+        }
+    }
+    pub fn account_busy(&self, ids: &[i64]) -> bool {
+        ids.iter()
+            .any(|id| self.actor(*id).is_some_and(|actor| !actor.offline))
+    }
+    pub fn take_deaths(&mut self) -> Vec<Actor> {
+        let mut pending = Vec::new();
+        let ids: Vec<i64> = self.entities.keys().copied().collect();
+        for id in ids {
+            let Some(entity) = self.entities.get(&id) else {
+                continue;
+            };
+            let Some(mut body) = self.world.get_mut::<Adventurer>(*entity) else {
+                continue;
+            };
+            if body.actor.pending_death {
+                body.actor.pending_death = false;
+                pending.push(body.actor.clone());
+            }
+        }
+        pending
     }
     pub fn leave(&mut self, id: i64) {
         if let Some(actor) = self.actor(id) {
@@ -358,11 +510,34 @@ impl Simulation {
         }
     }
 }
-fn advance(world: Res<Terrain>, mut tick: ResMut<Tick>, mut players: Query<&mut Adventurer>) {
+fn advance(
+    world: Res<Terrain>,
+    blocks: Res<Blocks>,
+    mut tick: ResMut<Tick>,
+    mut players: Query<&mut Adventurer>,
+) {
+    let blocks = blocks.0.clone();
     tick.0 += 1;
     for mut p in &mut players {
         p.actor.speed = 0.;
-        if p.actor.hp <= 0. || tick.0.saturating_sub(p.last_input) > 10 {
+        if p.actor.offline {
+            p.offline_age = p.offline_age.saturating_add(1);
+        }
+        if p.actor.offline && !p.actor.bound && p.actor.hp > 0. {
+            let post = if p.actor.orders.works || !p.actor.orders.returns {
+                p.actor.post
+            } else {
+                mortown_world::SPAWN
+            };
+            if !p.actor.orders.guards || p.actor.attack_target.is_none() {
+                p.target = post;
+            }
+            p.last_input = tick.0;
+        }
+        if p.actor.hp <= 0.
+            || p.actor.bound
+            || (!p.actor.offline && tick.0.saturating_sub(p.last_input) > 10)
+        {
             continue;
         }
         let from = [p.actor.position[0], p.actor.position[2]];
@@ -377,13 +552,25 @@ fn advance(world: Res<Terrain>, mut tick: ResMut<Tick>, mut players: Query<&mut 
             from[0] + dx / distance * step,
             from[1] + dz / distance * step,
         ];
-        let next = if world.0.segment_clear(from, desired) {
+        let clear = |a: [f32; 2], b: [f32; 2]| {
+            world.0.segment_clear(a, b) && !mortown_protocol::work::blocks_segment(&blocks, a, b)
+        };
+        let next = if clear(from, desired) {
             desired
         } else {
             [[desired[0], from[1]], [from[0], desired[1]]]
                 .into_iter()
-                .find(|candidate| world.0.segment_clear(from, *candidate))
+                .find(|candidate| clear(from, *candidate))
                 .unwrap_or(from)
+        };
+        let home = mortown_world::SPAWN;
+        let next = if p.actor.return_until > mortown_protocol::life::now_millis()
+            && (next[0] - home[0]).hypot(next[1] - home[1])
+                > mortown_protocol::life::return_radius()
+        {
+            from
+        } else {
+            next
         };
         let moved = (next[0] - from[0]).hypot(next[1] - from[1]);
         if moved > 0.0001 {
@@ -455,5 +642,35 @@ mod tests {
         actor.hp = 0.;
         sim.replace_actor(actor);
         assert!(sim.click_teleport(1, mortown_world::SPAWN).is_err());
+    }
+    #[test]
+    fn a_timber_block_stops_the_step() {
+        let mut sim = Simulation::new(Arc::new(mortown_world::World::new()));
+        let start = mortown_world::SPAWN;
+        sim.join(1, "Test".into(), start, 0.).unwrap();
+        sim.set_blocks(vec![mortown_protocol::work::Block {
+            id: 1,
+            position: [start[0] + 1., start[1]],
+            integrity: 4,
+            level: 0,
+        }]);
+        sim.input(1, 1, [start[0] + 8., start[1]], false).unwrap();
+        for _ in 0..40 {
+            sim.update();
+        }
+        let at = sim.actor(1).unwrap().position;
+        assert!((at[0] - (start[0] + 1.)).abs() > mortown_protocol::work::BLOCK_RADIUS - 0.2);
+        assert!(at[0] < start[0] + 1.);
+    }
+    #[test]
+    fn returning_to_an_offline_body_accepts_a_new_move_counter() {
+        let mut sim = Simulation::new(Arc::new(mortown_world::World::new()));
+        let start = mortown_world::SPAWN;
+        sim.join(1, "Test".into(), start, 0.).unwrap();
+        sim.input(1, 40, [start[0] + 5., start[1]], false).unwrap();
+        sim.disconnect(1);
+        sim.join(1, "Test".into(), start, 0.).unwrap();
+        assert!(sim.input(1, 1, [start[0] + 1., start[1]], false).is_ok());
+        assert!(!sim.actor(1).unwrap().offline);
     }
 }

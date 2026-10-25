@@ -1,9 +1,14 @@
-use crate::{mail, simulation::Simulation};
+use crate::{
+    inventory::{self, Change},
+    simulation::Simulation,
+    store::ExchangeFailure,
+};
 use mortown_protocol::{
     Actor, Character,
     exchange::{Command, Offer, Reply, View},
+    items::Stack,
+    transfer::{self, Holder, InventoryUpdate},
 };
-use sqlx::Connection;
 use std::{
     collections::{HashMap, HashSet},
     time::{Duration, Instant},
@@ -22,7 +27,8 @@ struct Session {
     names: [String; 2],
     accepted: bool,
     offers: [Offer; 2],
-    inventory: [Option<Character>; 2],
+    /// The offered stack as it was when offered; any change before the commit cancels.
+    offered: [Option<Stack>; 2],
     created: Instant,
 }
 impl Exchanges {
@@ -108,15 +114,8 @@ pub async fn poll(
     if sim.exchanges.updated.contains(&player) {
         // Read the latest character under the simulation lock, not a stale completion payload.
         let actor = sim.actor(player).ok_or("Персонаж вышел из мира")?;
-        let mut tx = conn
-            .begin()
-            .await
-            .map_err(|_| "Не удалось открыть сохранение обмена")?;
-        let c = mail::inventory(&mut tx, &actor).await?;
-        let update = mail::persist(&mut tx, actor, c, "Обмен завершён").await?;
-        tx.commit()
-            .await
-            .map_err(|_| "Не удалось сохранить состояние обмена")?;
+        let character = crate::store::sheet(conn, player).await?;
+        let update = Box::new(InventoryUpdate { character, actor });
         sim.exchanges.updated.remove(&player);
         reply
             .get_or_insert(Reply {
@@ -136,59 +135,93 @@ async fn commit(
     if s.offers.iter().all(|o| o.item.is_none() && o.coins == 0) {
         return Err("Обмен отменён: обе стороны пусты".into());
     }
-    let mut actors: [Actor; 2] = [
+    let actors: [Actor; 2] = [
         sim.actor(s.players[0]).ok_or("Участник вышел")?,
         sim.actor(s.players[1]).ok_or("Участник вышел")?,
     ];
-    let mut tx = conn.begin().await.map_err(|_| "База данных недоступна")?;
-    let mut chars: Vec<Option<Character>> = vec![None, None];
+    let [mut a, mut b] = actors;
     let order = if s.players[0] < s.players[1] {
         [0, 1]
     } else {
         [1, 0]
     };
-    for i in order {
-        chars[i] = Some(mail::inventory(&mut tx, &actors[i]).await?);
-    }
-    let mut chars = [chars[0].take().unwrap(), chars[1].take().unwrap()];
-    let mut kinds = [None, None];
-    for i in 0..2 {
-        if let Some(a) = s.offers[i].item {
-            let old = s.inventory[i].as_ref().ok_or("Выберите вещь заново")?;
-            if old.inventory != chars[i].inventory
-                || old.loot != chars[i].loot
-                || mortown_protocol::layout::bag(old) != mortown_protocol::layout::bag(&chars[i])
-            {
-                return Err("Обмен отменён: содержимое рюкзака изменилось".into());
+    let (first, second) = inventory::transaction(conn, async |tx| {
+        let mut chars: Vec<Option<Character>> = vec![None, None];
+        for i in order {
+            chars[i] = Some(inventory::load(tx, [&a, &b][i]).await?);
+        }
+        let mut chars = [chars[0].take().unwrap(), chars[1].take().unwrap()];
+        let before = [chars[0].items.clone(), chars[1].items.clone()];
+        let mut moved: [Option<Stack>; 2] = [None, None];
+        for i in 0..2 {
+            if let Some(o) = s.offers[i].item {
+                let now = chars[i].items.iter().find(|x| x.id == o.item).copied();
+                if now.is_none() || now != s.offered[i] {
+                    return Err("Обмен отменён: содержимое рюкзака изменилось".into());
+                }
+                moved[i] = Some(transfer::split(
+                    &mut chars[i].items,
+                    Holder::Character,
+                    o.item,
+                    o.quantity,
+                )?);
             }
-            kinds[i] = Some(mortown_protocol::transfer::take(&mut chars[i], &a)?);
+            if s.offers[i].coins > 0 {
+                transfer::pay(&mut chars[i].items, Holder::Character, s.offers[i].coins)
+                    .map_err(|_| "Обмен отменён: недостаточно монет")?;
+            }
         }
-        let balance = actors[i].progress.coins - f64::from(s.offers[i].coins);
-        if !balance.is_finite() || balance < 0. {
-            return Err("Обмен отменён: недостаточно монет".into());
+        for i in 0..2 {
+            if let Some(stack) = moved[i] {
+                transfer::put(&mut chars[1 - i].items, Holder::Character, stack)?;
+            }
+            let coins = s.offers[i].coins;
+            if coins > 0 {
+                let total = transfer::coins(&chars[1 - i].items, Holder::Character)
+                    .checked_add(coins)
+                    .ok_or("Баланс монет получателя переполнен")?;
+                transfer::set_coins(&mut chars[1 - i].items, Holder::Character, total)?;
+            }
         }
-        let result = balance + f64::from(s.offers[1 - i].coins);
-        if result > f64::from(u32::MAX) {
-            return Err("Баланс монет получателя переполнен".into());
+        for i in 0..2 {
+            transfer::check_carry(&before[i], &chars[i].items)
+                .map_err(|e| format!("Обмен отменён: {} — {e}", chars[i].nickname))?;
         }
-        actors[i].progress.coins = result;
-        actors[i].progress.write_stats(&mut chars[i].stats);
-    }
-    for i in 0..2 {
-        if let Some(kind) = kinds[i] {
-            mortown_protocol::transfer::give(
-                &mut chars[1 - i],
-                kind,
-                s.offers[i].item.unwrap().quantity,
-            )?;
+        inventory::sync(
+            tx,
+            &[
+                Change {
+                    owner: Some(chars[0].id),
+                    before: &before[0],
+                    after: &chars[0].items,
+                },
+                Change {
+                    owner: Some(chars[1].id),
+                    before: &before[1],
+                    after: &chars[1].items,
+                },
+            ],
+        )
+        .await?;
+        let first = inventory::finish(tx, &mut a, &chars[0], "Обмен завершён").await?;
+        let second = inventory::finish(tx, &mut b, &chars[1], "Обмен завершён").await?;
+        Ok((first, second))
+    })
+    .await
+    .map_err(|e| match e {
+        ExchangeFailure::Rejected(message) => message,
+        ExchangeFailure::Uncertain => {
+            "Не удалось подтвердить сохранение обмена; переподключитесь".into()
         }
-    }
-    let [a, b] = chars;
-    let first = mail::persist(&mut tx, actors[0].clone(), a, "Обмен завершён").await?;
-    let second = mail::persist(&mut tx, actors[1].clone(), b, "Обмен завершён").await?;
-    tx.commit()
-        .await
-        .map_err(|_| "Не удалось подтвердить сохранение обмена; переподключитесь")?;
+    })?;
+    let first = InventoryUpdate {
+        character: first,
+        actor: a,
+    };
+    let second = InventoryUpdate {
+        character: second,
+        actor: b,
+    };
     for update in [first, second] {
         sim.replace_actor(update.actor);
         sim.refresh_character(&update.character);
@@ -272,7 +305,7 @@ async fn apply(
             ],
             accepted: false,
             offers: Default::default(),
-            inventory: Default::default(),
+            offered: Default::default(),
             created: Instant::now(),
         };
         sim.exchanges.publish(&s, "Приглашение к обмену");
@@ -321,21 +354,27 @@ async fn apply(
                     return Err("Дождитесь принятия приглашения".into());
                 }
                 let actor = sim.actor(player).ok_or("Участник вышел")?;
-                if f64::from(coins) > actor.progress.coins {
+                let c =
+                    inventory::transaction(conn, async |tx| Ok(inventory::load(tx, &actor).await?))
+                        .await
+                        .map_err(|e| match e {
+                            ExchangeFailure::Rejected(message) => message,
+                            ExchangeFailure::Uncertain => "База данных недоступна".into(),
+                        })?;
+                if coins > transfer::coins(&c.items, Holder::Character) {
                     return Err("Недостаточно монет".into());
                 }
-                let mut tx = conn.begin().await.map_err(|_| "База данных недоступна")?;
-                let c = mail::inventory(&mut tx, &actor).await?;
+                let mut kind = 0;
+                s.offered[i] = None;
                 if let Some(a) = item {
-                    if a.price != 0 {
-                        return Err("Цена задаётся монетами обмена".into());
-                    }
-                    mortown_protocol::transfer::take(&mut c.clone(), &a)?;
+                    let mut probe = c.items.clone();
+                    let stack = transfer::split(&mut probe, Holder::Character, a.item, a.quantity)?;
+                    kind = stack.kind;
+                    s.offered[i] = c.items.iter().find(|x| x.id == a.item).copied();
                 }
-                tx.commit().await.map_err(|_| "База данных недоступна")?;
-                s.inventory[i] = Some(c);
                 s.offers[i] = Offer {
                     item,
+                    kind,
                     coins,
                     confirmed: false,
                 };

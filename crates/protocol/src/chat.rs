@@ -1,7 +1,12 @@
+//! Chat wire types: channels, client `Command`s (send, whisper, slash commands, ignore, report)
+//! and server `Reply`s (messages, statuses, admin dialogs). Slash-command parsing is in `commands`.
+//! Client: `client/src/chat.rs`; server: `server/src/chat.rs` and `console.rs`.
 use serde::{Deserialize, Serialize};
 pub mod commands;
+/// Max message length (chars); `INPUT_LIMIT` is the max raw input including slash commands.
 pub const LIMIT: usize = 280;
 pub const INPUT_LIMIT: usize = 512;
+/// "Local" channel reach in meters.
 pub const LOCAL_RADIUS: f32 = 60.;
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

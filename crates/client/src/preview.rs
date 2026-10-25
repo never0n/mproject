@@ -20,14 +20,13 @@ pub fn setup(
         network.mode = Mode::Menu;
         return;
     }
-    let mut stats = mortown_protocol::starting_stats(1, 1).unwrap();
+    let mut stats = mortown_protocol::starting_stats().unwrap();
     for (key, value) in [
         ("level", 12.),
         ("current_exp", 640.),
         ("exp", 1200.),
-        ("coins", 427.),
-        ("gold", 3.),
-        ("sp", 48.),
+        ("talent_point", 4.),
+        ("stat_point", 3.),
         ("current_hp", 182.),
         ("hp", 240.),
         ("current_mana", 86.),
@@ -39,9 +38,11 @@ pub fn setup(
     ] {
         stats.insert(key.into(), value);
     }
-    let loot = [
+    use mortown_protocol::items::{GOLD, Location, SILVER, Slot, Stack};
+    let mut items: Vec<Stack> = [
         (1, 1),
         (3, 1),
+        (2, 1),
         (4, 1),
         (6, 1),
         (7, 24),
@@ -50,33 +51,56 @@ pub fn setup(
         (10, 1),
     ]
     .into_iter()
+    .enumerate()
+    .map(|(n, (kind, quantity))| {
+        let location = match kind {
+            1 => Location::Worn { slot: Slot::Weapon },
+            3 => Location::Worn { slot: Slot::Armor },
+            _ => Location::Bag { cell: n as u16 },
+        };
+        Stack {
+            id: n as i64 + 1,
+            ..Stack::new(kind, quantity, location)
+        }
+    })
     .collect();
-    let mut inventory = mortown_protocol::items::starter(1);
-    mortown_protocol::items::include_loot(&mut inventory, &loot);
-    for (n, token) in [1_u64, 2, 0, 0, 8_u64 * (1 << 32), 0, 0, 0, 0, 0, 0, 0]
-        .into_iter()
-        .enumerate()
+    for (n, (kind, quantity)) in [(GOLD, 3), (SILVER, 4), (11, 27)].into_iter().enumerate() {
+        items.push(Stack {
+            id: 20 + n as i64,
+            ..Stack::new(kind, quantity, Location::Purse)
+        });
+    }
+    for (n, token) in [
+        1_u64,
+        2,
+        0,
+        0,
+        mortown_protocol::layout::kind_token(8),
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+    ]
+    .into_iter()
+    .enumerate()
     {
         stats.insert(format!("hotbar_{n}"), token as f64);
-    }
-    for item in &mut inventory {
-        item.equipped = matches!(item.kind, 1 | 3);
     }
     let c = mortown_protocol::Character {
         id: -1,
         slot: 1,
         nickname: "Эйрдан".into(),
-        race: 1,
-        class: 1,
         gender: 1,
         stats,
-        inventory,
-        loot,
+        items,
     };
     let actor = mortown_protocol::Actor {
         id: c.id,
         nickname: c.nickname.clone(),
-        equipment: mortown_protocol::items::EquipmentAppearance::from_inventory(&c.inventory),
+        equipment: mortown_protocol::items::EquipmentAppearance::from_items(&c.items),
         appearance: (&c).into(),
         position: player.translation.to_array(),
         yaw: 0.,
@@ -96,7 +120,21 @@ pub fn setup(
         progress: mortown_protocol::progression::Progress::from_stats(&c.stats),
         powers: Default::default(),
         reward_status: String::new(),
-        loot: c.loot.clone(),
+        downed: false,
+        bound: false,
+        offline: false,
+        lives: mortown_protocol::life::lives(),
+        return_seconds: 0,
+        death_mark: 0,
+        pending_death: false,
+        orders: Default::default(),
+        post: [0., 0.],
+        return_until: 0,
+        hunger: 0.,
+        thirst: 0.,
+        presented: String::new(),
+        face_hidden: false,
+        identity: 1.,
     };
     network.mode = Mode::Online;
     network.character = Some(c);
@@ -145,8 +183,6 @@ pub fn setup(
         inventory: screen == "inventory" || screen == "tooltip",
         skills: screen == "skills",
         menu: screen == "menu",
-        journal: screen == "journal",
-        mail: screen == "mail",
         ..default()
     };
     if screen == "menu" {
@@ -168,10 +204,8 @@ pub fn gallery(
         130 => "inventory",
         250 => "skills",
         370 => "character",
-        490 => "journal",
-        610 => "menu",
-        730 => "mail",
-        850 => "login",
+        490 => "menu",
+        730 => "login",
         _ => return,
     };
     let directory = options
@@ -190,40 +224,10 @@ pub fn gallery(
         open: name != "hud" && name != "login",
         inventory: name == "inventory",
         skills: name == "skills",
-        journal: name == "journal",
         menu: name == "menu",
-        mail: name == "mail",
         ..default()
     };
     combat.selected = None;
-    if name == "mail" {
-        let header = mortown_protocol::mail::Header {
-            id: 1,
-            return_of: None,
-            sender: "Мирэль".into(),
-            recipient: "Эйрдан".into(),
-            subject: "До встречи у северных ворот".into(),
-            sent_at: "14.09.2026 12:40".into(),
-            read: true,
-            attachment: Some(mortown_protocol::mail::Attachment {
-                kind: 8,
-                quantity: 3,
-                claimed: false,
-                returned: false,
-                price: 0,
-            }),
-        };
-        network.mail.receive(mortown_protocol::mail::Reply::List {
-            page: mortown_protocol::mail::Page {
-                folder: mortown_protocol::mail::Folder::Inbox,
-                page: 0,
-                total: 1,
-                unread: 0,
-                entries: vec![header.clone()],
-            },
-        });
-        network.mail.receive(mortown_protocol::mail::Reply::Read{letter:mortown_protocol::mail::Letter{header,body:"Эйрдан,\n\nмы отправляемся к северному перевалу на рассвете. Возьми припасы и тёплый плащ. Встречаемся у ворот, как только город проснётся.\n\nОставила тебе несколько зелий — в дороге пригодятся.\n\nМирэль".into()}});
-    }
     if name == "login" {
         network.mode = Mode::Menu;
         network.status.clear();

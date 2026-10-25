@@ -11,10 +11,10 @@ use bevy::{
 use mortown_protocol::alliance::{self, Command, Role};
 #[derive(Resource, Default)]
 pub struct Form {
-    pub warehouse: bool,
     owner: Option<i64>,
     alliance: Option<i64>,
     name: String,
+    kind: alliance::Kind,
     focused: bool,
     selected: Option<i64>,
     confirm: Option<Confirmation>,
@@ -49,9 +49,9 @@ pub struct Scroll;
 #[derive(Component, Clone, Copy)]
 pub enum Action {
     Open,
-    Warehouse,
     Field,
     Create,
+    Kind,
     Invite,
     Accept,
     Decline,
@@ -124,12 +124,12 @@ pub fn setup(mut commands: Commands, icons: Res<Icons>) {
                 })
                 .with_children(|p| {
                     for (a, name) in [
+                        (Action::Kind, "Тип организации"),
                         (Action::Create, "Создать · 1000 монет"),
                         (Action::Invite, "Пригласить"),
                         (Action::Accept, "Принять приглашение"),
                         (Action::Decline, "Отклонить"),
                         (Action::Refresh, "Обновить"),
-                        (Action::Warehouse, "Склад альянса"),
                     ] {
                         p.spawn(button(a)).with_children(|p| {
                             p.spawn(label(name, &icons.1, 13.));
@@ -243,13 +243,7 @@ pub fn input(
     mut wheel: ResMut<bevy::input::mouse::AccumulatedMouseScroll>,
     mut scroll: Single<(&ComputedNode, &UiGlobalTransform, &mut ScrollPosition), With<Scroll>>,
     window: Single<&Window, With<bevy::window::PrimaryWindow>>,
-    mut services: MessageReader<crate::npcs::ServiceRequest>,
-    world: Res<crate::Terrain>,
 ) {
-    let at_steward = services
-        .read()
-        .copied()
-        .any(|r| r.service == crate::npcs::Service::Alliance && r.valid(&network, &world.0));
     let inputs: Vec<_> = events.read().cloned().collect();
     for e in &inputs {
         if e.state == ButtonState::Released {
@@ -278,11 +272,8 @@ pub fn input(
         .iter()
         .find(|(_, i)| **i == Interaction::Pressed)
         .map(|(a, _)| *a);
-    if at_steward
-        || matches!(pressed, Some(Action::Open))
-        || !form.focused && !panels.mail && keys.just_pressed(KeyCode::KeyL)
-    {
-        let open = at_steward || !panels.alliance || !panels.open;
+    if matches!(pressed, Some(Action::Open)) || !form.focused && keys.just_pressed(KeyCode::KeyL) {
+        let open = !panels.alliance || !panels.open;
         *panels = CharacterWindow {
             open,
             alliance: open,
@@ -290,7 +281,6 @@ pub fn input(
         };
         form.focused = false;
         form.confirm = None;
-        form.warehouse = false;
         *movement = default();
         keys.reset(KeyCode::KeyL);
         if open {
@@ -328,22 +318,12 @@ pub fn input(
         return;
     }
     if !form.focused
-        && [
-            KeyCode::KeyC,
-            KeyCode::KeyI,
-            KeyCode::KeyK,
-            KeyCode::KeyM,
-            KeyCode::KeyJ,
-            KeyCode::KeyT,
-        ]
-        .iter()
-        .any(|k| keys.just_pressed(*k))
+        && [KeyCode::KeyC, KeyCode::KeyI, KeyCode::KeyK, KeyCode::KeyM]
+            .iter()
+            .any(|k| keys.just_pressed(*k))
     {
         *panels = default();
         form.confirm = None;
-        return;
-    }
-    if form.warehouse {
         return;
     }
     if wheel.delta.y != 0.
@@ -381,10 +361,6 @@ pub fn input(
                     .and_then(|a| a.members.iter().find(|m| Some(m.id) == form.selected))
                     .cloned();
                 let command = match action {
-                    Action::Warehouse => {
-                        form.warehouse = a.is_some();
-                        Some(Command::Refresh)
-                    }
                     Action::Refresh => Some(Command::Refresh),
                     Action::Accept => incoming.map(|i| Command::Accept { invitation: i.id }),
                     Action::Decline => incoming.map(|i| Command::Decline { invitation: i.id }),
@@ -392,13 +368,26 @@ pub fn input(
                         alliance: a.id,
                         nickname: form.name.trim().into(),
                     }),
+                    Action::Kind => {
+                        form.kind = match form.kind {
+                            alliance::Kind::Faction => alliance::Kind::Guild,
+                            alliance::Kind::Guild => alliance::Kind::Order,
+                            alliance::Kind::Order => alliance::Kind::Faction,
+                        };
+                        None
+                    }
                     Action::Create => {
                         match alliance::validate_name(&form.name) {
                             Ok(name) => {
+                                let kind = form.kind;
                                 form.confirm = Some(Confirmation {
-                                    command: Command::Create { name: name.into() },
+                                    command: Command::Create {
+                                        name: name.into(),
+                                        kind,
+                                    },
                                     message: format!(
-                                        "Создать «{name}» за 1000 монет? Плата не возвращается."
+                                        "Создать {} «{name}» за 1000 монет? Плата не возвращается.",
+                                        kind.label()
                                     ),
                                 });
                             }
@@ -529,11 +518,7 @@ pub fn display(
 ) {
     let online = network.mode == Mode::Online;
     let shown = online && panels.open && panels.alliance;
-    overlay.display = if shown && !form.warehouse {
-        Display::Flex
-    } else {
-        Display::None
-    };
+    overlay.display = if shown { Display::Flex } else { Display::None };
     let own = network.character.as_ref().map(|c| c.id).unwrap_or(0);
     let a = network.alliance.alliance.as_ref();
     let role = a.and_then(|a| a.role(own));
@@ -553,14 +538,21 @@ pub fn display(
                 Action::Field => {
                     !confirmation && (a.is_none() || role.is_some_and(Role::can_invite))
                 }
-                Action::Create => a.is_none() && !confirmation,
+                Action::Kind => !confirmation,
+                Action::Create => {
+                    !confirmation
+                        && !network
+                            .alliance
+                            .organizations
+                            .iter()
+                            .any(|org| org.kind == form.kind)
+                }
                 Action::Invite => {
                     a.is_some() && !confirmation && role.is_some_and(Role::can_invite)
                 }
                 Action::Accept | Action::Decline => incoming.is_some() && !confirmation,
                 Action::Member(n) => a.is_some_and(|a| a.members.get(*n).is_some()),
                 Action::Refresh => !confirmation,
-                Action::Warehouse => a.is_some() && !confirmation,
                 Action::Leave => role.is_some_and(|r| r != Role::Leader) && !confirmation,
                 Action::Dissolve => role == Some(Role::Leader) && !confirmation,
                 Action::Kick => {
@@ -616,8 +608,20 @@ pub fn display(
                 .unwrap_or_default()
         } else if summary {
             if let Some(a) = a {
+                let kinds = network
+                    .alliance
+                    .organizations
+                    .iter()
+                    .map(|org| format!("{} «{}»", org.kind.label(), org.name))
+                    .collect::<Vec<_>>()
+                    .join(", ");
                 format!(
-                    "{} · {}/{} участников · в игре {}\nВаша роль: {}",
+                    "{}\n{} · {}/{} · в игре {} · {}",
+                    if kinds.is_empty() {
+                        a.name.clone()
+                    } else {
+                        kinds
+                    },
                     a.name,
                     a.members.len(),
                     alliance::LIMIT,
@@ -630,7 +634,10 @@ pub fn display(
                     i.inviter, i.name, i.seconds_left
                 )
             } else {
-                "Вы пока не состоите в альянсе.\nСоздание: 1000 монет · до 20 участников.".into()
+                format!(
+                    "Организаций нет. Следующая будет {}.\nСоздание: 1000 монет · одна организация каждого типа.",
+                    form.kind.label()
+                )
             }
         } else if status {
             if network.alliance_pending {
@@ -664,7 +671,7 @@ pub fn display(
                 if a.is_some() {
                     "Имя приглашаемого"
                 } else {
-                    "Название альянса"
+                    "Название"
                 },
                 form.name,
                 if form.focused { "│" } else { "" }

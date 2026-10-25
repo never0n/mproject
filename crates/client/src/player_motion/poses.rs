@@ -1,3 +1,5 @@
+//! Hand-tuned keyframes for attack/spell/gesture poses, per weapon family.
+//! Purely visual; tweak numbers here to change how a swing looks.
 use bevy::prelude::*;
 use mortown_protocol::{actions::Kind, weapons::Family};
 #[derive(Clone, Copy)]
@@ -9,6 +11,8 @@ pub(super) struct Pose {
     pub chest: Quat,
     pub hand: Hand,
 }
+/// One keyframe: hand position in the chest bone's local space (meters),
+/// hand rotation and torso twist as Euler XYZ angles (radians).
 #[derive(Clone, Copy)]
 struct Key {
     hand: [f32; 3],
@@ -22,6 +26,7 @@ fn rotation(v: [f32; 3]) -> Quat {
     Quat::from_euler(EulerRot::XYZ, v[0], v[1], v[2])
 }
 
+/// Pose at progress `t` (0..1): rest → ready → strike → follow-through → rest.
 pub(super) fn sample(kind: Kind, family: Option<Family>, t: f32, skill: bool) -> Pose {
     let rest = k([-0.28, -0.18, 0.25], [0.15, 0., -0.1], [0.; 3]);
     let [ready, strike, follow] = match (kind, family) {
@@ -107,11 +112,13 @@ pub(super) fn sample(kind: Kind, family: Option<Family>, t: f32, skill: bool) ->
     } else {
         rest
     };
+    // Key times as fractions of the action duration; the hit visually lands around t = 0.48.
     let keys = [rest, ready, strike, follow, rest];
     let times = [0., 0.34, 0.48, 0.64, 1.];
     let i = (0..4).find(|&i| t <= times[i + 1]).unwrap_or(3);
     let blend = super::smooth((t - times[i]) / (times[i + 1] - times[i]));
     let mut torso = rotation(keys[i].torso).slerp(rotation(keys[i + 1].torso), blend);
+    // Skills exaggerate the torso twist by 12% (slerp past 1 extrapolates).
     if skill {
         torso = Quat::IDENTITY.slerp(torso, 1.12);
     }

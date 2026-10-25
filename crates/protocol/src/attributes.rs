@@ -1,4 +1,9 @@
+//! Spending attribute points: recomputes derived combat stats from primary attributes.
+//! Used by the server economy (`SpendAttribute`) and the client character window.
 use std::collections::BTreeMap;
+/// Spendable attributes: (stats key, display name). `INT_` has an underscore as in the original data.
+/// `WIT` and `MEN` are [PROPOSAL] internal keys for the two magic attributes whose names are
+/// not canon: cast speed / magic crit, and mana / magic defense. The labels are placeholders.
 pub const ATTRIBUTES: [(&str, &str); 6] = [
     ("STR", "Сила"),
     ("DEX", "Ловкость"),
@@ -11,8 +16,6 @@ pub const ATTRIBUTES: [(&str, &str); 6] = [
 /// Rebuild level-one bases, avoiding accumulated rounding and equipment bonuses.
 pub fn increase(
     stats: &mut BTreeMap<String, f64>,
-    race: u8,
-    class: u8,
     key: &str,
     expected: u32,
 ) -> Result<(), &'static str> {
@@ -25,7 +28,16 @@ pub fn increase(
     }
     let mut primary = stats.clone();
     primary.insert(key.into(), old + 1.);
-    let baseline = crate::starting_stats_with_primary(race, class, &primary)
+    rebase(stats, &primary)
+}
+
+/// Replaces primary attributes and every stat derived from them with the level-one values
+/// for `primary`; progress, pools and other keys stay untouched.
+pub fn rebase(
+    stats: &mut BTreeMap<String, f64>,
+    primary: &BTreeMap<String, f64>,
+) -> Result<(), &'static str> {
+    let baseline = crate::starting_stats_with_primary(primary)
         .ok_or("Не удалось пересчитать характеристики")?;
     for (k, v) in baseline {
         if k.starts_with("f_")
@@ -57,19 +69,19 @@ mod tests {
     use super::*;
     #[test]
     fn rebase_preserves_progress_and_rejects_stale_or_unknown_requests() {
-        let mut stats = crate::starting_stats(1, 1).unwrap();
+        let mut stats = crate::starting_stats().unwrap();
         stats.insert("level".into(), 6.);
         stats.insert("coins".into(), 123.);
         stats.insert("current_hp".into(), 50.);
         let con = stats["CON"] as u32;
-        increase(&mut stats, 1, 1, "CON", con).unwrap();
+        increase(&mut stats, "CON", con).unwrap();
         assert_eq!(stats["CON"], con as f64 + 1.);
         assert_eq!(stats["coins"], 123.);
         assert_eq!(stats["current_hp"], 50.);
         assert_eq!(stats["level"], 6.);
         let saved = stats.clone();
-        assert!(increase(&mut stats, 1, 1, "CON", con).is_err());
-        assert!(increase(&mut stats, 1, 1, "coins", 123).is_err());
+        assert!(increase(&mut stats, "CON", con).is_err());
+        assert!(increase(&mut stats, "coins", 123).is_err());
         assert_eq!(stats, saved);
     }
 }

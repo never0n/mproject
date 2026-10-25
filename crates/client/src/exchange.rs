@@ -5,8 +5,11 @@ use crate::{
 };
 use bevy::prelude::*;
 use mortown_protocol::{
+    Character,
     exchange::{Command, Offer},
-    mail::AttachmentRequest,
+    items::format_coins,
+    layout,
+    transfer::{self, Holder, ItemRequest},
 };
 #[derive(Component)]
 pub struct Overlay;
@@ -35,9 +38,10 @@ pub struct Picture(bool);
 #[derive(Resource, Default)]
 pub struct Form {
     session: Option<u64>,
-    item: Option<AttachmentRequest>,
-    coins: u32,
-    published: Option<(Option<AttachmentRequest>, u32)>,
+    item: Option<ItemRequest>,
+    /// Copper value; the purse pays it with change.
+    coins: u64,
+    published: Option<(Option<ItemRequest>, u64)>,
 }
 fn button(action: Action) -> impl Bundle {
     (
@@ -114,15 +118,15 @@ pub fn setup(mut commands: Commands, icons: Res<Icons>) {
                         (Action::All, "Вся стопка"),
                     ],
                     vec![
-                        (Action::Coins(-1000), "−1000"),
-                        (Action::Coins(-100), "−100"),
-                        (Action::Coins(-10), "−10"),
-                        (Action::Coins(-1), "−1"),
-                        (Action::Coins(1), "+1"),
-                        (Action::Coins(10), "+10"),
-                        (Action::Coins(100), "+100"),
-                        (Action::Coins(1000), "+1000"),
-                        (Action::Clear, "0 монет"),
+                        (Action::Coins(-10_000), "−1 з"),
+                        (Action::Coins(-100), "−1 с"),
+                        (Action::Coins(-10), "−10 м"),
+                        (Action::Coins(-1), "−1 м"),
+                        (Action::Coins(1), "+1 м"),
+                        (Action::Coins(10), "+10 м"),
+                        (Action::Coins(100), "+1 с"),
+                        (Action::Coins(10_000), "+1 з"),
+                        (Action::Clear, "Без монет"),
                     ],
                     vec![
                         (Action::Accept, "Принять приглашение"),
@@ -226,43 +230,36 @@ pub fn input(
         Action::Clear => form.coins = 0,
         Action::Coins(delta) => {
             let balance = network
-                .authoritative
-                .as_ref()
-                .map_or(0, |a| a.progress.coins as u32);
-            form.coins = (i64::from(form.coins) + delta).clamp(0, i64::from(balance)) as u32;
-        }
-        Action::Previous | Action::Next => {
-            let items = network
                 .character
                 .as_ref()
-                .map_or(Vec::new(), mortown_protocol::transfer::eligible);
+                .map_or(0, |c| transfer::coins(&c.items, Holder::Character));
+            form.coins = form.coins.saturating_add_signed(delta).min(balance);
+        }
+        Action::Previous | Action::Next => {
+            let items = network.character.as_ref().map_or(Vec::new(), |c| {
+                transfer::eligible(&c.items, Holder::Character)
+            });
             if !items.is_empty() {
                 let index = form
                     .item
-                    .and_then(|a| items.iter().position(|t| *t == a.token));
+                    .and_then(|a| items.iter().position(|id| *id == a.item));
                 let index = match (action, index) {
                     (Action::Previous, Some(i)) => (i + items.len() - 1) % items.len(),
                     (_, Some(i)) => (i + 1) % items.len(),
                     _ => 0,
                 };
-                form.item = Some(AttachmentRequest {
-                    token: items[index],
+                form.item = Some(ItemRequest {
+                    item: items[index],
                     quantity: 1,
-                    price: 0,
                 });
             }
         }
         Action::Less | Action::More | Action::All => {
             if let Some(mut a) = form.item
                 && let Some(c) = &network.character
-                && let Some(k) = mortown_protocol::layout::kind(a.token)
+                && let Some(stack) = layout::stack(c, a.item)
             {
-                let max = if mortown_protocol::items::equippable(k) {
-                    1
-                } else {
-                    mortown_protocol::layout::quantity(c, k)
-                        .min(mortown_protocol::transfer::MAX_AMOUNT)
-                };
+                let max = stack.quantity;
                 a.quantity = match action {
                     Action::Less => a.quantity.saturating_sub(1).max(1),
                     Action::More => a.quantity.saturating_add(1).min(max),
@@ -274,19 +271,22 @@ pub fn input(
         _ => {}
     }
 }
+fn kind_of(c: Option<&Character>, item: Option<ItemRequest>) -> u8 {
+    item.zip(c)
+        .and_then(|(a, c)| layout::stack(c, a.item))
+        .map_or(0, |s| s.kind)
+}
 fn describe(offer: &Offer) -> String {
     let item = offer
         .item
         .and_then(|a| {
-            mortown_protocol::layout::kind(a.token).and_then(|k| {
-                mortown_protocol::items::definition(k)
-                    .map(|d| format!("{} ×{}", d.name, a.quantity))
-            })
+            mortown_protocol::items::definition(offer.kind)
+                .map(|d| format!("{} ×{}", d.name, a.quantity))
         })
         .unwrap_or("Без предмета".into());
     format!(
-        "{item} · {} монет · {}",
-        offer.coins,
+        "{item} · {} · {}",
+        format_coins(offer.coins),
         if offer.confirmed {
             "ПОДТВЕРЖДЕНО"
         } else {
@@ -350,6 +350,7 @@ pub fn display(
     let dirty = (form.item, form.coins) != (v.own.item, v.own.coins);
     let own = Offer {
         item: form.item,
+        kind: kind_of(network.character.as_ref(), form.item),
         coins: form.coins,
         confirmed: v.own.confirmed && !dirty,
     };
@@ -386,8 +387,12 @@ pub fn display(
         node.display = if show { Display::Flex } else { Display::None };
     }
     for (picture, mut image, mut node, mut hint) in &mut pictures {
-        let item = if picture.0 { form.item } else { v.other.item };
-        let kind = item.and_then(|a| mortown_protocol::layout::kind(a.token));
+        let kind = if picture.0 {
+            Some(kind_of(network.character.as_ref(), form.item))
+        } else {
+            v.other.item.map(|_| v.other.kind)
+        }
+        .filter(|k| *k != 0);
         node.display = if kind.is_some() {
             Display::Flex
         } else {

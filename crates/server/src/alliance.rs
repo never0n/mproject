@@ -27,21 +27,48 @@ fn role(leader: i64, owner: i64, officer: bool) -> Role {
         Role::Member
     }
 }
-async fn membership(conn: &mut PgConnection, owner: i64) -> Result<Option<(i64, Role)>, String> {
-    Ok(sqlx::query("SELECT a.id,a.leader_id,m.officer FROM alliance_members m JOIN alliances a ON a.id=m.alliance_id WHERE m.character_id=$1")
-        .bind(owner).fetch_optional(conn).await.map_err(database)?
-        .map(|r| (r.get("id"),role(r.get("leader_id"),owner,r.get("officer")))))
+async fn seats(conn: &mut PgConnection, owner: i64) -> Result<Vec<(i64, i16, Role)>, String> {
+    let rows = sqlx::query(
+        "SELECT a.id, a.kind, a.leader_id, m.officer FROM alliance_members m \
+         JOIN alliances a ON a.id = m.alliance_id \
+         JOIN characters c ON c.id = m.character_id \
+         WHERE m.character_id=$1 AND (m.identity = COALESCE((c.stats->>'identity')::float8, 1) \
+            OR a.leader_id = m.character_id) \
+         ORDER BY a.kind, a.id",
+    )
+    .bind(owner)
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(database)?;
+    Ok(rows
+        .iter()
+        .map(|row| {
+            (
+                row.get("id"),
+                row.get("kind"),
+                role(row.get("leader_id"), owner, row.get("officer")),
+            )
+        })
+        .collect())
 }
 pub async fn audience(conn: &mut PgConnection, owner: i64) -> Result<(i64, Vec<i64>), String> {
-    let (id, _) = membership(conn, owner)
-        .await?
-        .ok_or("Вы не состоите в альянсе")?;
-    let members =
-        sqlx::query_scalar("SELECT character_id FROM alliance_members WHERE alliance_id=$1")
-            .bind(id)
-            .fetch_all(conn)
-            .await
-            .map_err(database)?;
+    let owned = seats(conn, owner).await?;
+    let id = owned
+        .first()
+        .map(|seat| seat.0)
+        .ok_or("Вы не состоите в организации")?;
+    let mut members = Vec::new();
+    for (org, _, _) in &owned {
+        let rows: Vec<i64> =
+            sqlx::query_scalar("SELECT character_id FROM alliance_members WHERE alliance_id=$1")
+                .bind(org)
+                .fetch_all(&mut *conn)
+                .await
+                .map_err(database)?;
+        members.extend(rows);
+    }
+    members.sort_unstable();
+    members.dedup();
     Ok((id, members))
 }
 pub async fn view(conn: &mut PgConnection, owner: i64, actors: &[Actor]) -> Result<Reply, String> {
@@ -51,16 +78,44 @@ pub async fn view(conn: &mut PgConnection, owner: i64, actors: &[Actor]) -> Resu
         .await
         .map_err(database)?;
     let mut reply = Reply::default();
-    if let Some((id,_))=membership(&mut tx,owner).await? {
-        let a=sqlx::query("SELECT name,leader_id FROM alliances WHERE id=$1").bind(id).fetch_one(&mut *tx).await.map_err(database)?;
-        let leader:i64=a.get("leader_id");
+    let owned = seats(&mut tx, owner).await?;
+    for (id, kind, _) in &owned {
+        let a = sqlx::query("SELECT name,leader_id FROM alliances WHERE id=$1")
+            .bind(id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(database)?;
+        let leader: i64 = a.get("leader_id");
         let rows=sqlx::query("SELECT c.id,c.nickname,coalesce((c.stats->>'level')::double precision,1) AS level,m.officer FROM alliance_members m JOIN characters c ON c.id=m.character_id WHERE m.alliance_id=$1 ORDER BY (c.id=$2) DESC,m.officer DESC,m.joined_at,c.id")
             .bind(id).bind(leader).fetch_all(&mut *tx).await.map_err(database)?;
-        reply.alliance=Some(View {id,name:a.get("name"),members:rows.iter().map(|r| {
-            let id=r.get("id"); let actor=actors.iter().find(|a|a.id==id);
-            Member{id,nickname:r.get("nickname"),level:actor.map_or(r.get::<f64,_>("level") as u32,|a|a.progress.level),role:role(leader,id,r.get("officer")),online:actor.is_some()}
-        }).collect(),storage:crate::alliance_storage::read(&mut tx,id).await?});
-    } else if let Some(r)=sqlx::query("SELECT i.id,i.alliance_id,a.name,c.nickname,greatest(0,ceil(extract(epoch FROM i.expires_at-now())))::int AS seconds FROM alliance_invitations i JOIN alliances a ON a.id=i.alliance_id JOIN characters c ON c.id=i.inviter_id JOIN alliance_members m ON m.character_id=i.inviter_id AND m.alliance_id=a.id WHERE i.recipient_id=$1 AND i.expires_at>now() AND (a.leader_id=i.inviter_id OR m.officer)")
+        reply.organizations.push(View {
+            id: *id,
+            kind: alliance::Kind::parse(*kind),
+            name: a.get("name"),
+            members: rows
+                .iter()
+                .map(|r| {
+                    let id = r.get("id");
+                    let actor = actors.iter().find(|a| a.id == id);
+                    Member {
+                        id,
+                        nickname: r.get("nickname"),
+                        level: actor.map_or(r.get::<f64, _>("level") as u32, |a| a.progress.level),
+                        role: role(leader, id, r.get("officer")),
+                        online: actor.is_some(),
+                    }
+                })
+                .collect(),
+        });
+    }
+    reply.alliance = reply
+        .organizations
+        .iter()
+        .find(|org| org.kind == alliance::Kind::Guild)
+        .cloned()
+        .or_else(|| reply.organizations.first().cloned());
+    if reply.alliance.is_none()
+        && let Some(r)=sqlx::query("SELECT i.id,i.alliance_id,a.name,c.nickname,greatest(0,ceil(extract(epoch FROM i.expires_at-now())))::int AS seconds FROM alliance_invitations i JOIN alliances a ON a.id=i.alliance_id JOIN characters c ON c.id=i.inviter_id JOIN alliance_members m ON m.character_id=i.inviter_id AND m.alliance_id=a.id WHERE i.recipient_id=$1 AND i.expires_at>now() AND (a.leader_id=i.inviter_id OR m.officer)")
         .bind(owner).fetch_optional(&mut *tx).await.map_err(database)? {
         reply.invitation=Some(Invitation{id:r.get("id"),alliance:r.get("alliance_id"),name:r.get("name"),inviter:r.get("nickname"),seconds_left:r.get::<i32,_>("seconds") as u32});
     }
@@ -89,11 +144,33 @@ pub struct Change {
 /// Caller holds the simulation lock and replaces the actor only after this transaction commits.
 pub async fn apply(
     conn: &mut PgConnection,
+    actor: Actor,
+    command: Command,
+) -> Result<Change, Failure> {
+    let mut tx = conn.begin().await.map_err(database)?;
+    let change = match change(&mut tx, actor, command).await {
+        Ok(change) => change,
+        Err(e) => {
+            // Roll back now: a dropped transaction would keep the advisory and row locks
+            // until this session's connection runs its next query.
+            tx.rollback().await.map_err(database)?;
+            return Err(e);
+        }
+    };
+    if let Err(e) = tx.commit().await {
+        if change.update.is_some() {
+            return Err(Failure::UncertainInventory);
+        }
+        return Err(database(e).into());
+    }
+    Ok(change)
+}
+async fn change(
+    tx: &mut PgConnection,
     mut actor: Actor,
     command: Command,
 ) -> Result<Change, Failure> {
     let owner = actor.id;
-    let mut tx = conn.begin().await.map_err(database)?;
     sqlx::query("SET LOCAL lock_timeout = '3s'")
         .execute(&mut *tx)
         .await
@@ -107,55 +184,65 @@ pub async fn apply(
         .execute(&mut *tx)
         .await
         .map_err(database)?;
-    let own = membership(&mut tx, owner).await?;
+    let own = seats(&mut *tx, owner).await?;
     let mut update = None;
     let message = match command {
         Command::Refresh => "Состав обновлён",
-        Command::Create { name } => {
+        Command::Create { name, kind } => {
             let name = alliance::validate_name(&name)?;
-            if own.is_some() {
-                return Err("Вы уже состоите в альянсе".into());
+            if own.iter().any(|seat| seat.1 == kind.code()) {
+                return Err("Вы уже состоите в организации этого типа".into());
             }
             if actor.hp <= 0. {
                 return Err("Сначала возродитесь".into());
             }
-            if !actor.progress.coins.is_finite() || actor.progress.coins < alliance::CREATE_COST {
-                return Err("Создание альянса стоит 1000 монет".into());
-            }
             let id: i64 = sqlx::query_scalar(
-                "INSERT INTO alliances(name,leader_id) VALUES($1,$2) RETURNING id",
+                "INSERT INTO alliances(name,leader_id,kind) VALUES($1,$2,$3) RETURNING id",
             )
             .bind(name)
             .bind(owner)
+            .bind(kind.code())
             .fetch_one(&mut *tx)
             .await
             .map_err(database)?;
-            sqlx::query("INSERT INTO alliance_members(alliance_id,character_id) VALUES($1,$2)")
-                .bind(id)
-                .bind(owner)
-                .execute(&mut *tx)
-                .await
-                .map_err(database)?;
+            sqlx::query(
+                "INSERT INTO alliance_members(alliance_id,character_id,kind,identity) \
+                 VALUES($1,$2,$3,COALESCE((SELECT (stats->>'identity')::float8 FROM characters WHERE id=$2),1))",
+            )
+            .bind(id)
+            .bind(owner)
+            .bind(kind.code())
+            .execute(&mut *tx)
+            .await
+            .map_err(database)?;
             sqlx::query("DELETE FROM alliance_invitations WHERE recipient_id=$1")
                 .bind(owner)
                 .execute(&mut *tx)
                 .await
                 .map_err(database)?;
-            actor.progress.coins -= alliance::CREATE_COST;
-            actor.reward_status = "Создан альянс · −1000 монет".into();
-            crate::store::save(&mut tx, &actor).await?;
-            let row = sqlx::query("SELECT * FROM characters WHERE id=$1")
-                .bind(owner)
-                .fetch_one(&mut *tx)
-                .await
-                .map_err(database)?;
-            update = Some((crate::store::character(&row)?, actor));
-            "Альянс создан · −1000 монет"
+            let price = mortown_protocol::items::format_coins(alliance::CREATE_COST);
+            let character = crate::inventory::pay(
+                &mut *tx,
+                &mut actor,
+                alliance::CREATE_COST,
+                &format!("Создан альянс · −{price}"),
+            )
+            .await
+            .map_err(|e| {
+                if e == "Недостаточно монет" {
+                    format!("Создание альянса стоит {price}")
+                } else {
+                    e
+                }
+            })?;
+            update = Some((character, actor));
+            "Альянс создан"
         }
         Command::Invite { alliance, nickname } => {
-            let (_, r) = own
-                .filter(|(id, _)| *id == alliance)
-                .ok_or("Вы больше не в этом альянсе")?;
+            let (_, _, r) = *own
+                .iter()
+                .find(|seat| seat.0 == alliance)
+                .ok_or("Вы больше не в этой организации")?;
             if !r.can_invite() {
                 return Err("Приглашать могут лидер и офицеры".into());
             }
@@ -169,8 +256,18 @@ pub async fn apply(
                     .await
                     .map_err(database)?
                     .ok_or("Персонаж не найден")?;
-            if target == owner || membership(&mut tx, target).await?.is_some() {
-                return Err("Персонаж уже состоит в альянсе".into());
+            let kind: i16 = sqlx::query_scalar("SELECT kind FROM alliances WHERE id=$1")
+                .bind(alliance)
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(database)?;
+            if target == owner
+                || seats(&mut *tx, target)
+                    .await?
+                    .iter()
+                    .any(|seat| seat.1 == kind)
+            {
+                return Err("Персонаж уже состоит в организации этого типа".into());
             }
             let blocked: bool = sqlx::query_scalar(
                 "SELECT EXISTS(SELECT 1 FROM chat_ignores WHERE owner_id=$1 AND blocked_id=$2)",
@@ -188,28 +285,31 @@ pub async fn apply(
                 return Err("В альянсе 20 мест, включая действующие приглашения".into());
             }
             let pending: bool = sqlx::query_scalar(
-                "SELECT EXISTS(SELECT 1 FROM alliance_invitations WHERE recipient_id=$1)",
+                "SELECT EXISTS(SELECT 1 FROM alliance_invitations WHERE recipient_id=$1 AND kind=$2)",
             )
             .bind(target)
+            .bind(kind)
             .fetch_one(&mut *tx)
             .await
             .map_err(database)?;
             if pending {
                 return Err("У персонажа уже есть действующее приглашение".into());
             }
-            sqlx::query("INSERT INTO alliance_invitations(recipient_id,alliance_id,inviter_id,expires_at) VALUES($1,$2,$3,now()+interval '120 seconds')").bind(target).bind(alliance).bind(owner).execute(&mut *tx).await.map_err(database)?;
+            sqlx::query("INSERT INTO alliance_invitations(recipient_id,alliance_id,inviter_id,expires_at,kind) VALUES($1,$2,$3,now()+interval '120 seconds',$4)").bind(target).bind(alliance).bind(owner).bind(kind).execute(&mut *tx).await.map_err(database)?;
             "Приглашение отправлено на две минуты"
         }
         Command::Accept { invitation } => {
-            if own.is_some() {
-                return Err("Вы уже состоите в альянсе".into());
-            }
-            let i=sqlx::query("SELECT alliance_id,inviter_id FROM alliance_invitations WHERE id=$1 AND recipient_id=$2 AND expires_at>now()").bind(invitation).bind(owner).fetch_optional(&mut *tx).await.map_err(database)?.ok_or("Приглашение истекло или отменено")?;
+            let i=sqlx::query("SELECT alliance_id,inviter_id,kind FROM alliance_invitations WHERE id=$1 AND recipient_id=$2 AND expires_at>now()").bind(invitation).bind(owner).fetch_optional(&mut *tx).await.map_err(database)?.ok_or("Приглашение истекло или отменено")?;
             let id: i64 = i.get("alliance_id");
             let inviter: i64 = i.get("inviter_id");
-            if !membership(&mut tx, inviter)
+            let kind: i16 = i.get("kind");
+            if own.iter().any(|seat| seat.1 == kind) {
+                return Err("Вы уже состоите в организации этого типа".into());
+            }
+            if !seats(&mut *tx, inviter)
                 .await?
-                .is_some_and(|(a, r)| a == id && r.can_invite())
+                .iter()
+                .any(|seat| seat.0 == id && seat.2.can_invite())
             {
                 return Err("Пригласивший больше не управляет этим альянсом".into());
             }
@@ -222,18 +322,23 @@ pub async fn apply(
             if count >= alliance::LIMIT as i64 {
                 return Err("Альянс заполнен".into());
             }
-            sqlx::query("INSERT INTO alliance_members(alliance_id,character_id) VALUES($1,$2)")
-                .bind(id)
+            sqlx::query(
+                "INSERT INTO alliance_members(alliance_id,character_id,kind,identity) \
+                 VALUES($1,$2,$3,COALESCE((SELECT (stats->>'identity')::float8 FROM characters WHERE id=$2),1))",
+            )
+            .bind(id)
+            .bind(owner)
+            .bind(kind)
+            .execute(&mut *tx)
+            .await
+            .map_err(database)?;
+            sqlx::query("DELETE FROM alliance_invitations WHERE recipient_id=$1 AND kind=$2")
                 .bind(owner)
+                .bind(kind)
                 .execute(&mut *tx)
                 .await
                 .map_err(database)?;
-            sqlx::query("DELETE FROM alliance_invitations WHERE recipient_id=$1")
-                .bind(owner)
-                .execute(&mut *tx)
-                .await
-                .map_err(database)?;
-            "Вы вступили в альянс"
+            "Вы вступили в организацию"
         }
         Command::Decline { invitation } => {
             let result =
@@ -249,27 +354,30 @@ pub async fn apply(
             "Приглашение отклонено"
         }
         Command::Leave { alliance } => {
-            let (_, r) = own
-                .filter(|(id, _)| *id == alliance)
-                .ok_or("Вы больше не в этом альянсе")?;
+            let (_, _, r) = *own
+                .iter()
+                .find(|seat| seat.0 == alliance)
+                .ok_or("Вы больше не в этой организации")?;
             if r == Role::Leader {
-                return Err("Сначала передайте лидерство или распустите альянс".into());
+                return Err("Сначала передайте лидерство или распустите организацию".into());
             }
-            remove_member(&mut tx, owner).await?;
+            remove_member(&mut *tx, owner, alliance).await?;
             "Вы вышли из альянса"
         }
         Command::Kick { alliance, player } => {
-            let (_, r) = own
-                .filter(|(id, _)| *id == alliance)
-                .ok_or("Вы больше не в этом альянсе")?;
-            let (_, target) = membership(&mut tx, player)
+            let (_, _, r) = *own
+                .iter()
+                .find(|seat| seat.0 == alliance)
+                .ok_or("Вы больше не в этой организации")?;
+            let (_, _, target) = *seats(&mut *tx, player)
                 .await?
-                .filter(|(id, _)| *id == alliance)
-                .ok_or("Участник уже покинул альянс")?;
+                .iter()
+                .find(|seat| seat.0 == alliance)
+                .ok_or("Участник уже покинул организацию")?;
             if player == owner || !r.can_kick(target) {
                 return Err("Недостаточно прав для исключения этого участника".into());
             }
-            remove_member(&mut tx, player).await?;
+            remove_member(&mut *tx, player, alliance).await?;
             "Участник исключён"
         }
         Command::SetOfficer {
@@ -277,21 +385,30 @@ pub async fn apply(
             player,
             officer,
         } => {
-            if own != Some((alliance, Role::Leader)) || player == owner {
+            if own
+                .iter()
+                .find(|seat| seat.0 == alliance)
+                .is_none_or(|seat| seat.2 != Role::Leader)
+                || player == owner
+            {
                 return Err("Назначать офицеров может только лидер".into());
             }
-            if membership(&mut tx, player)
+            if seats(&mut *tx, player)
                 .await?
-                .is_none_or(|(id, _)| id != alliance)
+                .iter()
+                .all(|seat| seat.0 != alliance)
             {
-                return Err("Участник уже покинул альянс".into());
+                return Err("Участник уже покинул организацию".into());
             }
-            sqlx::query("UPDATE alliance_members SET officer=$2 WHERE character_id=$1")
-                .bind(player)
-                .bind(officer)
-                .execute(&mut *tx)
-                .await
-                .map_err(database)?;
+            sqlx::query(
+                "UPDATE alliance_members SET officer=$2 WHERE character_id=$1 AND alliance_id=$3",
+            )
+            .bind(player)
+            .bind(officer)
+            .bind(alliance)
+            .execute(&mut *tx)
+            .await
+            .map_err(database)?;
             if !officer {
                 sqlx::query("DELETE FROM alliance_invitations WHERE inviter_id=$1")
                     .bind(player)
@@ -306,14 +423,20 @@ pub async fn apply(
             }
         }
         Command::Transfer { alliance, player } => {
-            if own != Some((alliance, Role::Leader)) || player == owner {
+            if own
+                .iter()
+                .find(|seat| seat.0 == alliance)
+                .is_none_or(|seat| seat.2 != Role::Leader)
+                || player == owner
+            {
                 return Err("Лидерство передаёт действующий лидер другому участнику".into());
             }
-            if membership(&mut tx, player)
+            if seats(&mut *tx, player)
                 .await?
-                .is_none_or(|(id, _)| id != alliance)
+                .iter()
+                .all(|seat| seat.0 != alliance)
             {
-                return Err("Участник уже покинул альянс".into());
+                return Err("Участник уже покинул организацию".into());
             }
             sqlx::query("UPDATE alliances SET leader_id=$2 WHERE id=$1")
                 .bind(alliance)
@@ -321,53 +444,22 @@ pub async fn apply(
                 .execute(&mut *tx)
                 .await
                 .map_err(database)?;
-            sqlx::query("UPDATE alliance_members SET officer=(character_id=$1) WHERE character_id IN ($1,$2)").bind(owner).bind(player).execute(&mut *tx).await.map_err(database)?;
+            sqlx::query("UPDATE alliance_members SET officer=(character_id=$1) WHERE alliance_id=$3 AND character_id IN ($1,$2)").bind(owner).bind(player).bind(alliance).execute(&mut *tx).await.map_err(database)?;
             "Лидерство передано; вы стали офицером"
         }
-        Command::Deposit {
-            alliance,
-            revision,
-            item,
-        } => {
-            own.filter(|(id, _)| *id == alliance)
-                .ok_or("Вы больше не в этом альянсе")?;
-            let change =
-                crate::alliance_storage::deposit(&mut tx, actor, alliance, revision, item).await?;
-            update = Some((change.character, change.actor));
-            "Предметы переданы на склад альянса"
-        }
-        Command::Withdraw {
-            alliance,
-            revision,
-            entry,
-            quantity,
-        } => {
-            let (_, role) = own
-                .filter(|(id, _)| *id == alliance)
-                .ok_or("Вы больше не в этом альянсе")?;
-            if role == Role::Member {
-                return Err("Забирать со склада могут лидер и офицеры".into());
-            }
-            let change = crate::alliance_storage::withdraw(
-                &mut tx, actor, alliance, revision, entry, quantity,
-            )
-            .await?;
-            update = Some((change.character, change.actor));
-            "Предметы получены со склада альянса"
-        }
         Command::Dissolve { alliance } => {
-            if own != Some((alliance, Role::Leader)) {
-                return Err("Распустить альянс может только лидер".into());
+            if own
+                .iter()
+                .find(|seat| seat.0 == alliance)
+                .is_none_or(|seat| seat.2 != Role::Leader)
+            {
+                return Err("Распустить организацию может только лидер".into());
             }
-            let occupied: bool = sqlx::query_scalar(
-                "SELECT EXISTS(SELECT 1 FROM alliance_storage WHERE alliance_id=$1)",
-            )
-            .bind(alliance)
-            .fetch_one(&mut *tx)
-            .await
-            .map_err(database)?;
-            if occupied {
-                return Err("Сначала освободите склад альянса".into());
+            if crate::legacy::alliance_owns(&mut *tx, alliance)
+                .await
+                .map_err(database)?
+            {
+                return Err(crate::legacy::KEPT.into());
             }
             sqlx::query("DELETE FROM alliances WHERE id=$1")
                 .bind(alliance)
@@ -377,26 +469,22 @@ pub async fn apply(
             "Альянс распущен; стоимость создания не возвращается"
         }
     };
-    if let Err(e) = tx.commit().await {
-        if update.is_some() {
-            return Err(Failure::UncertainInventory);
-        }
-        return Err(database(e).into());
-    }
     Ok(Change {
         message: message.into(),
         update,
     })
 }
-async fn remove_member(conn: &mut PgConnection, owner: i64) -> Result<(), String> {
-    sqlx::query("DELETE FROM alliance_invitations WHERE inviter_id=$1")
+async fn remove_member(conn: &mut PgConnection, owner: i64, alliance: i64) -> Result<(), String> {
+    sqlx::query("DELETE FROM alliance_invitations WHERE inviter_id=$1 AND alliance_id=$2")
         .bind(owner)
+        .bind(alliance)
         .execute(&mut *conn)
         .await
         .map_err(database)?;
-    sqlx::query("DELETE FROM alliance_members WHERE character_id=$1")
+    sqlx::query("DELETE FROM alliance_members WHERE character_id=$1 AND alliance_id=$2")
         .bind(owner)
-        .execute(conn)
+        .bind(alliance)
+        .execute(&mut *conn)
         .await
         .map_err(database)?;
     Ok(())

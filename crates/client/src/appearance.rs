@@ -14,7 +14,6 @@ use std::{collections::BTreeMap, f32::consts::FRAC_PI_2};
 pub enum Wearer {
     Local,
     Remote(i64),
-    Npc(u8),
     Enemy(mortown_protocol::monsters::Kind),
     Preview,
 }
@@ -529,17 +528,12 @@ pub fn display(
                 network
                     .character
                     .as_ref()
-                    .map(|c| EquipmentAppearance::from_inventory(&c.inventory))
+                    .map(|c| EquipmentAppearance::from_items(&c.items))
             }),
             Wearer::Local => network
                 .character
                 .as_ref()
-                .map(|c| EquipmentAppearance::from_inventory(&c.inventory)),
-            // Residents carry fitted work tools, managed by residents::prepare.
-            Wearer::Npc(_) => Some(EquipmentAppearance {
-                weapon: None,
-                armor: None,
-            }),
+                .map(|c| EquipmentAppearance::from_items(&c.items)),
             Wearer::Enemy(kind) => Some(EquipmentAppearance {
                 weapon: Some(match kind {
                     mortown_protocol::monsters::Kind::Bandit => 26,

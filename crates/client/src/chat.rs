@@ -1,3 +1,8 @@
+//! Chat panel (bottom left): channel tabs, message list, input line, ignore/report.
+//! `Log` (stored as `Network::chat`) holds what the server sent; `Form` is local input state.
+//! `input` owns the keyboard while the chat is focused, so typed letters never trigger
+//! game hotkeys; it runs before every other hotkey system in the Update chain.
+//! Submodules: `windows` (server-driven dialogs and settings), `admin` (staff panel).
 pub mod admin;
 pub mod windows;
 use crate::{
@@ -14,20 +19,29 @@ use bevy::{
     prelude::*,
 };
 use mortown_protocol::chat::{Channel, Command, Message, Reply};
+/// Chat data received from the server; lives inside `Network` and is filled by `receive`.
 #[derive(Default)]
 pub struct Log {
+    /// Last 100 messages; must not exceed the 100 `Entry` rows spawned in `setup`.
     pub messages: Vec<Message>,
     pub status: String,
+    /// A chat command is awaiting the server's reply; blocks sending another.
     pub pending: bool,
+    /// Server accepted the last command; `input` then clears the draft.
     pub sent: bool,
+    /// Bumped on every change so the list can auto-scroll to the newest line.
     pub revision: u64,
+    /// "Система" tab lines (last 100).
     pub system: Vec<String>,
+    /// Ignored sender ids, synced from the server.
     pub ignored: std::collections::HashSet<i64>,
     pub ignore_all: bool,
     pub silence: bool,
+    /// Modal window requested by the server (settings, help, confirm, admin); see `windows`.
     pub dialog: Option<mortown_protocol::chat::Dialog>,
 }
 impl Log {
+    /// Shows a line in the status bar and appends it to the "Система" tab.
     fn record(&mut self, message: String) {
         self.status = message.clone();
         self.system.push(message);
@@ -37,6 +51,8 @@ impl Log {
         self.revision += 1;
     }
 
+    /// Called by `network::receive` for every chat `Reply`. Status, Acknowledged, Notice
+    /// and Dialog end the pending request; the others are unsolicited pushes.
     pub fn receive(&mut self, reply: Reply, _owner: i64) {
         match reply {
             Reply::Message { message } => {
@@ -80,35 +96,47 @@ impl Log {
         }
     }
 }
+/// Local chat input state; reset whenever the hero changes or the client leaves the world.
 #[derive(Resource, Default)]
 pub struct Form {
+    /// Keys pressed while typing; hidden from gameplay until physically released.
     suppressed: std::collections::HashSet<KeyCode>,
     last_party: Option<u64>,
     last_alliance: Option<i64>,
+    /// Active tab; `None` = "Система".
     channel: Option<Channel>,
     focused: bool,
     draft: String,
+    /// Byte offset into `draft` (always on a char boundary).
     caret: usize,
     owner: Option<i64>,
+    /// Clicked message (id, sender) for Ignore/Report.
     selected: Option<(i64, String)>,
     revision: u64,
+    /// Stick to the newest message; cleared when the user scrolls up.
     bottom: bool,
+    /// Set by `windows::input` while a dialog is open, so chat swallows keys that frame too.
     modal_capture: bool,
 }
+/// Chat panel root; `movable::Fixed`, so it cannot be dragged.
 #[derive(Component)]
 pub struct Root;
 #[derive(Component)]
 pub struct Scroll;
+/// One of 100 pre-spawned message rows; index into `Log::messages`.
 #[derive(Component)]
 pub struct Entry(pub usize);
 #[derive(Component)]
 pub struct EntryText(pub usize);
+/// Input line text.
 #[derive(Component)]
 pub struct FieldText;
 #[derive(Component)]
 pub struct Status;
+/// Rows visible only on the "Система" tab.
 #[derive(Component)]
 pub struct System;
+/// The system log text (`Log::system`).
 #[derive(Component)]
 pub struct ConsoleSystem;
 #[derive(Component, Clone, Copy)]
@@ -149,6 +177,7 @@ pub fn setup(mut commands: Commands, icons: Res<Icons>) {
                 ..default()
             },
             BackgroundColor(Color::srgba(0.025, 0.04, 0.055, 0.68)),
+            // Below window overlays (10).
             GlobalZIndex(5),
         ))
         .with_children(|p| {
@@ -160,7 +189,7 @@ pub fn setup(mut commands: Commands, icons: Res<Icons>) {
             })
             .with_children(|row| {
                 for (channel, name) in [
-                    (Some(Channel::General), "Общий"),
+                    (Some(Channel::General), "Рядом"),
                     (Some(Channel::Local), "Рядом"),
                     (Some(Channel::Group), "Группа"),
                     (Some(Channel::Alliance), "Альянс"),
@@ -195,6 +224,7 @@ pub fn setup(mut commands: Commands, icons: Res<Icons>) {
                     label("", &icons.1, 12.),
                 ));
                 list.spawn((System, ConsoleSystem, label("", &icons.1, 12.)));
+                // Fixed pool of rows, reused instead of spawning per message; 100 = `Log` cap.
                 for index in 0..100 {
                     list.spawn((
                         Entry(index),
@@ -239,11 +269,63 @@ pub fn setup(mut commands: Commands, icons: Res<Icons>) {
             });
         });
 }
-fn submit(form: &mut Form, network: &mut Network, target: Option<mortown_protocol::admin::Target>) {
+/// Turns the draft into a server command: a recognised "/" command → `Admin` (with the current
+/// target), `"nick text` → whisper, anything else → message to the active channel.
+/// Validation uses the shared protocol rules; errors go to the system log, nothing is sent.
+fn submit(
+    form: &mut Form,
+    network: &mut Network,
+    target: Option<mortown_protocol::admin::Target>,
+    person: Option<i64>,
+) {
     if network.chat.pending {
         return;
     }
     let raw = form.draft.as_str();
+    if let Some(name) = raw.strip_prefix("/имя ") {
+        match mortown_protocol::society::claim(name) {
+            Ok(name) => network
+                .society_request(mortown_protocol::society::Command::Present { name: name.into() }),
+            Err(e) => network.chat.record(e.into()),
+        }
+        form.draft.clear();
+        return;
+    }
+    if raw == "/лицо" {
+        network.society_request(mortown_protocol::society::Command::Cover { hidden: true });
+        form.draft.clear();
+        return;
+    }
+    if raw == "/открыть" {
+        network.society_request(mortown_protocol::society::Command::Cover { hidden: false });
+        form.draft.clear();
+        return;
+    }
+    if let Some(text) = raw.strip_prefix("/письмо ") {
+        network.work_request(mortown_protocol::work::Command::WriteDocument { text: text.into() });
+        form.draft.clear();
+        return;
+    }
+    if raw == "/птица" {
+        network.work_request(mortown_protocol::work::Command::DispatchDocument);
+        form.draft.clear();
+        return;
+    }
+    if let Some(note) = raw.strip_prefix("/запомнить ") {
+        if let Some(person) = person {
+            match mortown_protocol::society::note(note) {
+                Ok(note) => network.society_request(mortown_protocol::society::Command::Remember {
+                    person,
+                    note: note.into(),
+                }),
+                Err(e) => network.chat.record(e.into()),
+            }
+        } else {
+            network.chat.record("Сначала выберите человека".into());
+        }
+        form.draft.clear();
+        return;
+    }
     let command = match mortown_protocol::chat::commands::parse(raw) {
         Err(e) => {
             network.chat.record(e.into());
@@ -286,6 +368,8 @@ fn submit(form: &mut Form, network: &mut Network, target: Option<mortown_protoco
     network.chat_request(command);
 }
 
+/// Focus, typing, scrolling and chat buttons. While focused it clears all keyboard state
+/// at the end (`keys.reset_all`) so later systems see no key presses.
 pub fn input(
     mut form: ResMut<Form>,
     combat: Res<crate::combat::CombatUi>,
@@ -293,6 +377,8 @@ pub fn input(
     mut panels: ResMut<crate::ui::CharacterWindow>,
     mut crafting: ResMut<crate::crafting::Open>,
     mut keys: ResMut<ButtonInput<KeyCode>>,
+    // Two readers of the same messages, each with its own cursor: releases are always read,
+    // typed events only when focused.
     mut events: MessageReader<KeyboardInput>,
     mut releases: MessageReader<KeyboardInput>,
     mut wheel: ResMut<AccumulatedMouseScroll>,
@@ -355,6 +441,7 @@ pub fn input(
         form.draft.clear();
         form.caret = 0;
     }
+    // A modal dialog owns the keyboard (including the frame it was closed on).
     if network.chat.dialog.is_some() || std::mem::take(&mut form.modal_capture) {
         form.focused = false;
         form.suppressed.extend(pressed);
@@ -368,6 +455,7 @@ pub fn input(
         .is_some_and(|p| crate::actionbar::contains(scroll.0, scroll.1, p))
         && wheel.delta.y != 0.
     {
+        // Mouse wheels report lines, touchpads pixels; ~24 px per line.
         let amount = wheel.delta.y
             * if wheel.unit == MouseScrollUnit::Line {
                 24.
@@ -376,11 +464,13 @@ pub fn input(
             };
         scroll.2.y = (scroll.2.y - amount).max(0.);
         form.bottom = false;
+        // Consume the wheel so the camera does not zoom too.
         wheel.delta = Vec2::ZERO;
     }
     if form.revision != network.chat.revision {
         form.revision = network.chat.revision;
         if form.bottom {
+            // Bevy clamps this to the real maximum: "scroll to end".
             scroll.2.y = f32::MAX;
         }
     }
@@ -390,7 +480,7 @@ pub fn input(
             .iter()
             .any(|(i, a)| *i == Interaction::Pressed && matches!(a, Action::Field));
     // Keep Enter for letter editing, but ordinary game windows must not prevent chat focus.
-    if wants_chat && !panels.mail && !panels.alliance && network.exchange.is_none() {
+    if wants_chat && !panels.alliance && network.exchange.is_none() {
         *panels = default();
         crafting.0 = false;
     }
@@ -402,6 +492,7 @@ pub fn input(
     }
     if let Some((_, entry)) = entries.iter().find(|(i, _)| **i == Interaction::Pressed)
         && let Some(m) = network.chat.messages.get(entry.0)
+        // Own messages can't be ignored or reported.
         && Some(m.sender) != owner
     {
         form.selected = Some((m.id, m.nickname.clone()));
@@ -453,6 +544,7 @@ pub fn input(
         events.clear();
         return;
     }
+    // Focused: stop walking and hide every held key from gameplay.
     form.suppressed.extend(pressed);
     *movement = default();
     if keys.just_pressed(KeyCode::Escape) {
@@ -461,6 +553,7 @@ pub fn input(
         keys.reset_all();
         return;
     }
+    // Skip the frame focus was gained, so the opening Enter isn't also typed/submitted.
     if !opened && !network.chat.pending {
         for event in events.read() {
             if event.state != ButtonState::Pressed {
@@ -473,9 +566,15 @@ pub fn input(
                 }
                 KeyCode::Enter | KeyCode::NumpadEnter if event.repeat => {}
                 KeyCode::Enter | KeyCode::NumpadEnter => {
-                    submit(&mut form, &mut network, admin::target(&combat));
+                    submit(
+                        &mut form,
+                        &mut network,
+                        admin::target(&combat),
+                        combat.player,
+                    );
                     break;
                 }
+                // Caret moves by whole UTF-8 characters, never into the middle of a Cyrillic letter.
                 KeyCode::Backspace => {
                     if form.caret > 0 {
                         let prev = form.draft[..form.caret]
@@ -509,6 +608,7 @@ pub fn input(
                 KeyCode::End => form.caret = form.draft.len(),
                 _ => {
                     if let Some(text) = &event.text {
+                        // Limit is in characters here (not bytes, unlike the lobby).
                         let left = mortown_protocol::chat::INPUT_LIMIT
                             .saturating_sub(form.draft.chars().count());
                         let added: String = text
@@ -527,6 +627,8 @@ pub fn input(
     events.clear();
     keys.reset_all();
 }
+/// Fills the row pool and the input line. The many `Without<...>` filters only keep the
+/// queries disjoint (Bevy B0001).
 pub fn display(
     network: Res<Network>,
     form: Res<Form>,
@@ -593,6 +695,8 @@ pub fn display(
             Display::None
         };
     }
+    // Row visible if: not ignored, belongs to this tab (whispers show on every channel tab),
+    // and group/alliance messages are from the player's current group/alliance.
     for (entry, mut node) in &mut entries {
         let display = if network.chat.messages.get(entry.0).is_some_and(|m| {
             !network.chat.ignore_all
@@ -638,6 +742,7 @@ pub fn display(
             text.0 = value;
         }
     }
+    // The field is one line: show the last 36 chars, or 24 before / 12 after the caret.
     let draft: String = form
         .draft
         .chars()

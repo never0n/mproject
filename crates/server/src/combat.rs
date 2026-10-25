@@ -7,12 +7,11 @@ mod rewards;
 
 pub struct Fighter {
     stats: BTreeMap<String, f64>,
-    class: u8,
-    race: u8,
-    smoke_until: u64,
     next_attack: u64,
     last_combat: u64,
+    /// Tick when a downed body stands up, unless a later hit already finished it.
     respawn_at: u64,
+    finished: bool,
 }
 pub struct Mob {
     pub view: Monster,
@@ -60,17 +59,13 @@ impl Mob {
             motion_started: 0,
         }
     }
-    fn defence(&self, class: u8, tick: u64) -> f64 {
+    fn defence(&self, magical: bool) -> f64 {
         let spec = self.view.kind.definition();
-        self.effects.defence(
-            class,
-            tick,
-            if class == 2 {
-                spec.magical_defence
-            } else {
-                spec.physical_defence
-            },
-        )
+        if magical {
+            spec.magical_defence
+        } else {
+            spec.physical_defence
+        }
     }
     fn cancel_cast(&mut self, tick: u64) {
         if self.casting.take().is_some() {
@@ -118,18 +113,26 @@ pub struct Combat {
     next_area: u64,
     next_action: u64,
     rewards: Vec<rewards::Defeat>,
+    /// Earned drops and coins per character, waiting to be stored as physical stacks.
+    pub grants: HashMap<i64, Vec<(u8, u32)>>,
 }
 #[cfg(test)]
-fn grant_reward(actor: &mut Actor, fighter: &mut Fighter, random: fn() -> f64) {
-    let drops = rewards::roll_drops(fighter.class, Kind::Bandit, random);
+fn grant_reward(
+    actor: &mut Actor,
+    fighter: &mut Fighter,
+    random: fn() -> f64,
+    grants: &mut Vec<(u8, u32)>,
+) {
+    let magical = mortown_protocol::weapons::magical(actor.equipment.weapon);
+    let drops = rewards::roll_drops(magical, Kind::Bandit, random);
     rewards::grant_share(
         actor,
         fighter,
         mortown_protocol::progression::KILL_EXPERIENCE,
-        mortown_protocol::progression::KILL_COINS,
+        Kind::Bandit.definition().coins,
         &drops,
         false,
-        Kind::Bandit,
+        grants,
     );
 }
 fn point(a: &Actor) -> [f32; 2] {
@@ -196,6 +199,37 @@ fn living(actors: &[Actor], id: i64) -> Option<(usize, &Actor)> {
 /// Without this target, an idle mob at home treats the hit as the end of combat and restores all HP.
 fn aggro(actor: &Actor, target: &mut Option<i64>) {
     *target = Some(actor.id);
+}
+/// Applies one hit. A standing body falls at 0 HP; only a later hit finishes it, and only once.
+fn hurt(actor: &mut Actor, fighter: &mut Fighter, hit: f64, tick: u64) {
+    if hit <= 0. || actor.powers.immortal {
+        return;
+    }
+    match mortown_protocol::life::blow(actor.hp, actor.downed, hit, tick) {
+        mortown_protocol::life::Blow::Standing(hp) => actor.hp = hp,
+        mortown_protocol::life::Blow::Down { rise_at } => {
+            if !actor.downed {
+                actor.hp = 0.;
+                actor.downed = true;
+                actor.speed = 0.;
+                actor.actions.clear();
+                actor.effects.clear();
+                actor.attack_target = None;
+                fighter.respawn_at = rise_at;
+                fighter.finished = false;
+                actor.combat_status =
+                    "Вы без сознания. Подъём сам, отдельный удар добивает.".into();
+            }
+        }
+        mortown_protocol::life::Blow::Finished => {
+            if !fighter.finished {
+                fighter.finished = true;
+                actor.death_mark = actor.death_mark.saturating_add(1);
+                actor.pending_death = true;
+                actor.combat_status = "Вас добили.".into();
+            }
+        }
+    }
 }
 fn pay(immortal: bool, pool: &mut f64, cost: f64) -> bool {
     if immortal {
@@ -299,6 +333,7 @@ impl Combat {
             next_area: 0,
             next_action: 0,
             rewards: vec![],
+            grants: HashMap::new(),
         }
     }
     pub fn spawn_admin(&mut self, kind: Kind, position: [f32; 3]) -> Result<u32, &'static str> {
@@ -352,15 +387,18 @@ impl Combat {
     }
     pub fn player_admin(&mut self, a: &mut Actor, kill: bool, tick: u64) {
         if let Some(f) = self.fighters.get_mut(&a.id) {
-            a.hp = if kill { 0. } else { a.max_hp };
-            if !kill {
+            if kill {
+                hurt(a, f, a.max_hp.max(1.), tick);
+            } else {
+                a.hp = a.max_hp;
+                a.downed = false;
                 a.mana = stat(&f.stats, "mana");
                 a.stamina = stat(&f.stats, "stamina");
+                a.respawn_seconds = 0;
+                f.respawn_at = 0;
+                f.finished = false;
             }
-            a.respawn_seconds = if kill { 10 } else { 0 };
-            f.respawn_at = if kill { tick + 200 } else { 0 };
             f.last_combat = tick;
-            f.smoke_until = 0;
             a.effects.clear();
             a.actions.clear();
             a.attack_target = None;
@@ -381,8 +419,7 @@ impl Combat {
     pub fn configure(&mut self, c: &Character, actor: &mut Actor, tick: u64) {
         actor.actions.clear();
         actor.appearance = c.into();
-        actor.equipment =
-            mortown_protocol::items::EquipmentAppearance::from_inventory(&c.inventory);
+        actor.equipment = mortown_protocol::items::EquipmentAppearance::from_items(&c.items);
         actor.ability_cooldowns_ms = std::array::from_fn(|n| {
             self.ability_ready
                 .get(&(c.id, n as u8 + 3))
@@ -405,24 +442,45 @@ impl Combat {
             .unwrap_or(0)
             .saturating_sub(tick) as u32
             * 50;
-        actor.loot = c.loot.clone();
         actor.effects.clear();
         actor.progress = mortown_protocol::progression::Progress::from_stats(&c.stats);
         actor.max_hp = stat(&c.stats, "hp").max(1.);
         actor.hp = stat(&c.stats, "current_hp").clamp(0., actor.max_hp);
-        actor.respawn_seconds = if actor.hp <= 0. { 10 } else { 0 };
-        actor.mana = stat(&c.stats, "current_mana");
-        actor.stamina = stat(&c.stats, "current_stamina");
+        let ended = c.stats.get("ended").copied() == Some(1.);
+        actor.downed = ended || actor.hp <= 0.;
+        if ended {
+            actor.hp = 0.;
+        }
+        actor.bound = c.stats.get("bound").copied() == Some(1.);
+        actor.lives = c
+            .stats
+            .get("lives")
+            .copied()
+            .unwrap_or(f64::from(mortown_protocol::life::lives())) as u32;
+        actor.orders = mortown_protocol::life::Orders::from_stats(&c.stats);
+        actor.return_until = c.stats.get("return_until").copied().unwrap_or(0.) as u64;
+        actor.pending_death = false;
+        actor.hunger = c.stats.get("hunger").copied().unwrap_or(0.).clamp(0., 100.);
+        actor.thirst = c.stats.get("thirst").copied().unwrap_or(0.).clamp(0., 100.);
+        actor.respawn_seconds = if actor.downed {
+            mortown_protocol::life::knock_ticks().div_ceil(20) as u32
+        } else {
+            0
+        };
+        actor.mana = stat(&c.stats, "current_mana").clamp(0., stat(&c.stats, "mana"));
+        actor.stamina = stat(&c.stats, "current_stamina").clamp(0., stat(&c.stats, "stamina"));
         self.fighters.insert(
             c.id,
             Fighter {
                 stats: c.stats.clone(),
-                class: c.class,
-                race: c.race,
-                smoke_until: 0,
                 next_attack: tick,
                 last_combat: tick,
-                respawn_at: if actor.hp <= 0. { tick + 200 } else { 0 },
+                respawn_at: if ended || !actor.downed {
+                    0
+                } else {
+                    tick + mortown_protocol::life::knock_ticks()
+                },
+                finished: ended,
             },
         );
     }
@@ -437,8 +495,10 @@ impl Combat {
             f.stats.insert("level".into(), level as f64);
         }
     }
+    /// The session stores pending grants before leaving; anything left here is dropped.
     pub fn leave(&mut self, id: i64) {
         self.fighters.remove(&id);
+        self.grants.remove(&id);
         self.areas.retain(|a| a.owner != id);
         for m in &mut self.mobs {
             m.effects.dots.retain(|d| d.owner != id);
@@ -450,15 +510,17 @@ impl Combat {
         target: Option<u32>,
         world: &mortown_world::World,
     ) -> Result<(), &'static str> {
+        if actor.bound {
+            return Err("Вы связаны и не можете действовать");
+        }
         if actor.hp <= 0. {
-            return Err("Вы погибли. Нажмите R после отсчёта");
+            return Err("Вы без сознания");
         }
         if let Some(id) = target {
-            let f = self
-                .fighters
-                .get(&actor.id)
-                .ok_or("Персонаж не готов к бою")?;
-            let range = mortown_protocol::weapons::attack_range(actor.equipment.weapon, f.class);
+            if !self.fighters.contains_key(&actor.id) {
+                return Err("Персонаж не готов к бою");
+            }
+            let range = mortown_protocol::weapons::attack_range(actor.equipment.weapon);
             self.validate_target(actor, id, range, world)?;
         }
         actor.attack_target = target;
@@ -477,8 +539,11 @@ impl Combat {
         range: f32,
         world: &mortown_world::World,
     ) -> Result<(), &'static str> {
+        if actor.bound {
+            return Err("Вы связаны и не можете действовать");
+        }
         if actor.hp <= 0. {
-            return Err("Вы погибли. Нажмите R после отсчёта");
+            return Err("Вы без сознания");
         }
         let mob = self
             .mobs
@@ -528,24 +593,20 @@ impl Combat {
         tick: u64,
         secondary: bool,
     ) -> Result<(), &'static str> {
-        if !secondary && actor.progress.primary_disabled {
-            return Err("Навык не изучен");
+        let skill_id = if secondary { 2 } else { 1 };
+        if !actor.progress.known(skill_id) {
+            return Err("Этот навык ещё не открыт практикой");
         }
-        if secondary && !actor.progress.secondary_learned {
-            return Err("Сначала изучите второй навык в окне K");
+        if !self.fighters.contains_key(&actor.id) {
+            return Err("Персонаж не готов к бою");
         }
-        // Skill reach is independent of the currently equipped autoattack weapon.
-        let class = self
-            .fighters
-            .get(&actor.id)
-            .ok_or("Персонаж не готов к бою")?
-            .class;
+        // The skill's own reach applies, not the autoattack range of the weapon family.
+        let magical = mortown_protocol::weapons::magical(actor.equipment.weapon);
         let skill = if secondary {
-            mortown_protocol::skills::secondary(class)
+            mortown_protocol::skills::secondary(magical)
         } else {
-            mortown_protocol::skills::ranked(class, actor.progress.skill_rank)
-        }
-        .ok_or("Навык недоступен")?;
+            mortown_protocol::skills::ranked(magical, actor.progress.skill_rank)
+        };
         self.validate_target(actor, target, skill.range, world)?;
         let f = self.fighters.get_mut(&actor.id).unwrap();
         let ready = if secondary {
@@ -565,7 +626,7 @@ impl Combat {
             return Err("Подойдите ближе к цели");
         }
         let immortal = actor.powers.immortal;
-        let resource = if f.class == 2 {
+        let resource = if magical {
             &mut actor.mana
         } else {
             &mut actor.stamina
@@ -580,11 +641,13 @@ impl Combat {
             actor.skill_cooldown_ms = skill.cooldown_ticks as u32 * 50;
         }
         f.last_combat = tick;
-        let prefix = if f.class == 2 { "m" } else { "f" };
+        let prefix = if magical { "m" } else { "f" };
         let s = |key: &str| stat(&f.stats, &format!("{prefix}_{key}"));
         let (hit, crit) = strike(
-            s("attack") * skill.multiplier,
-            m.defence(f.class, tick),
+            s("attack")
+                * skill.multiplier
+                * mortown_protocol::progression::activity_scale(&f.stats, magical),
+            m.defence(magical),
             s("accuracy"),
             m.view.kind.definition().evasion,
             s("crit_chance"),
@@ -601,7 +664,7 @@ impl Combat {
             &mut self.next_action,
             actor,
             tick,
-            if class == 2 {
+            if magical {
                 mortown_protocol::actions::Kind::Spell
             } else {
                 mortown_protocol::actions::Kind::Weapon
@@ -634,36 +697,31 @@ impl Combat {
                 kind: m.view.kind,
             });
         }
+        if actor.progress.practice(skill_id) && skill_id < mortown_protocol::skills::LAST_SKILL {
+            actor.combat_status.push_str(" · открыт следующий навык");
+        }
         Ok(())
     }
-    pub fn respawn(
-        &mut self,
-        actor: &mut Actor,
-        world: &mortown_world::World,
-        tick: u64,
-    ) -> Result<(), &'static str> {
+    /// Standing up after knockdown. This is not a new life and does not move the body.
+    pub fn respawn(&mut self, actor: &mut Actor, tick: u64) -> Result<(), &'static str> {
         let f = self
             .fighters
             .get_mut(&actor.id)
             .ok_or("Персонаж не найден")?;
-        if actor.hp > 0. {
-            return Err("Персонаж жив");
+        if actor.pending_death || f.finished {
+            return Err("Смерть уже наступила");
+        }
+        if !actor.downed {
+            return Err("Вы в сознании");
         }
         if tick < f.respawn_at {
-            return Err("Возрождение ещё недоступно");
+            return Err("Подниматься ещё рано");
         }
-        let p = mortown_world::SPAWN;
-        actor.position = [p[0], world.surface_height(p[0], p[1]), p[1]];
-        actor.hp = actor.max_hp;
-        actor.mana = stat(&f.stats, "mana");
-        actor.stamina = stat(&f.stats, "stamina");
+        actor.downed = false;
+        actor.hp = mortown_protocol::life::rise_hp(actor.max_hp);
         actor.respawn_seconds = 0;
-        actor.effects.clear();
-        f.smoke_until = 0;
-        actor.attack_target = None;
-        actor.actions.clear();
-        actor.combat_status = "Вы возродились на площади".into();
-        f.last_combat = tick;
+        actor.combat_status = "Вы пришли в себя".into();
+        f.respawn_at = 0;
         Ok(())
     }
     pub fn resolve_rewards(&mut self, actors: &mut [Actor], parties: &mut crate::party::Parties) {
@@ -673,6 +731,7 @@ impl Combat {
             parties,
             &mut self.rewards,
             self.random,
+            &mut self.grants,
         );
     }
     pub fn update(
@@ -696,6 +755,18 @@ impl Combat {
             }
             a.actions
                 .retain(|action| action.elapsed_ms < action.duration_ms);
+            if tick > 0 && tick.is_multiple_of(20) {
+                let (hunger, thirst) = mortown_protocol::work::pass_time(a.hunger, a.thirst, 1.);
+                a.hunger = hunger;
+                a.thirst = thirst;
+            }
+            if tick > 0
+                && tick.is_multiple_of(200)
+                && mortown_protocol::work::starving(a.hunger, a.thirst)
+                && let Some(f) = self.fighters.get_mut(&a.id)
+            {
+                hurt(a, f, 1., tick);
+            }
             a.ability_cooldowns_ms = std::array::from_fn(|n| {
                 self.ability_ready
                     .get(&(a.id, n as u8 + 3))
@@ -721,22 +792,32 @@ impl Combat {
             let Some(f) = self.fighters.get_mut(&a.id) else {
                 continue;
             };
+            if a.downed && !f.finished && f.respawn_at > 0 && tick >= f.respawn_at {
+                a.downed = false;
+                a.hp = mortown_protocol::life::rise_hp(a.max_hp);
+                a.respawn_seconds = 0;
+                a.combat_status = "Вы пришли в себя".into();
+                f.respawn_at = 0;
+            }
+            if a.hp > 0. {
+                a.downed = false;
+            }
+            let left = a
+                .return_until
+                .saturating_sub(mortown_protocol::life::now_millis());
+            a.return_seconds = if a.downed {
+                f.respawn_at.saturating_sub(tick).div_ceil(20) as u32
+            } else {
+                (left / 1000) as u32
+            };
             if a.hp <= 0. {
                 a.actions.clear();
                 a.effects.clear();
-                f.smoke_until = 0;
                 a.attack_target = None;
                 a.respawn_seconds = f.respawn_at.saturating_sub(tick).div_ceil(20) as u32;
                 continue;
             }
-            a.effects = if f.smoke_until > tick {
-                vec![mortown_protocol::skills::Status {
-                    kind: mortown_protocol::skills::StatusKind::Smoke,
-                    remaining_ms: (f.smoke_until - tick) as u32 * 50,
-                }]
-            } else {
-                vec![]
-            };
+            a.effects.clear();
             if tick.is_multiple_of(20) && tick.saturating_sub(f.last_combat) > 200 {
                 a.hp = (a.hp + 2.).min(a.max_hp);
                 a.mana = (a.mana + 3.).min(stat(&f.stats, "mana"));
@@ -753,8 +834,8 @@ impl Combat {
                 a.attack_target = None;
                 continue;
             };
-            let magical = f.class == 2;
-            let range = mortown_protocol::weapons::attack_range(a.equipment.weapon, f.class);
+            let magical = mortown_protocol::weapons::magical(a.equipment.weapon);
+            let range = mortown_protocol::weapons::attack_range(a.equipment.weapon);
             if mortown_world::distance(point(a), pos(m)) > range
                 || !world.segment_clear(point(a), pos(m))
             {
@@ -780,8 +861,8 @@ impl Combat {
             let prefix = if magical { "m" } else { "f" };
             let s = |key: &str| stat(&f.stats, &format!("{prefix}_{key}"));
             let (hit, crit) = strike(
-                s("attack"),
-                m.defence(f.class, tick),
+                s("attack") * mortown_protocol::progression::activity_scale(&f.stats, magical),
+                m.defence(magical),
                 s("accuracy"),
                 m.view.kind.definition().evasion,
                 s("crit_chance"),
@@ -903,21 +984,14 @@ impl Combat {
             let destination = index.map(|i| point(&actors[i])).unwrap_or(m.home);
             let distance = mortown_world::distance(pos(m), destination);
             let clear_shot = index.is_some() && world.segment_clear(pos(m), destination);
-            let can_attack = index.is_some()
-                && clear_shot
-                && distance <= spec.range
-                && m.effects.stun_until <= tick;
+            let can_attack = index.is_some() && clear_shot && distance <= spec.range;
             if m.casting
                 .is_some_and(|(id, _)| !can_attack || m.target != Some(id))
             {
                 m.cancel_cast(tick);
             }
             let stop = if clear_shot { spec.range - 0.3 } else { 0.1 };
-            if m.effects.stun_until <= tick
-                && m.casting.is_none()
-                && m.view.attack.is_none()
-                && distance > stop
-            {
+            if m.casting.is_none() && m.view.attack.is_none() && distance > stop {
                 let from = pos(m);
                 let factor = if tick < m.effects.sand_until {
                     0.5
@@ -943,7 +1017,6 @@ impl Combat {
             if let Some(i) = index {
                 let a = &mut actors[i];
                 if mortown_world::distance(point(a), pos(m)) <= spec.range
-                    && m.effects.stun_until <= tick
                     && tick >= m.next_attack
                     && world.segment_clear(pos(m), point(a))
                 {
@@ -993,12 +1066,10 @@ impl Combat {
                                 1.5,
                                 self.random,
                             );
-                            let accuracy = m.effects.accuracy_multiplier(tick)
-                                * if f.smoke_until > tick { 0.2 } else { 1. };
+                            let accuracy = m.effects.accuracy_multiplier(tick);
                             if accuracy < 1. && (self.random)() >= accuracy {
                                 hit = 0.;
                             }
-                            a.hp = (a.hp - hit).max(0.);
                             if hit > 0. {
                                 a.combat_status = format!(
                                     "{}{}: {hit:.0} урона{}",
@@ -1010,16 +1081,7 @@ impl Combat {
                                     },
                                     if crit { " · крит" } else { "" }
                                 );
-                            }
-                            if a.hp <= 0. {
-                                a.actions.clear();
-                                a.effects.clear();
-                                f.smoke_until = 0;
-                                a.speed = 0.;
-                                a.attack_target = None;
-                                f.respawn_at = tick + 200;
-                                a.combat_status =
-                                    "Вы погибли. R — возродиться через 10 секунд".into();
+                                hurt(a, f, hit, tick);
                             }
                         }
                     }
@@ -1063,6 +1125,7 @@ impl Combat {
                         parties,
                         &mut self.rewards,
                         self.random,
+                        &mut self.grants,
                     );
                 }
             }
@@ -1079,38 +1142,47 @@ mod tests {
     use crate::simulation::Simulation;
     use std::sync::Arc;
     fn character(hp: f64) -> Character {
-        let mut stats = mortown_protocol::starting_stats(1, 1).unwrap();
+        let mut stats = mortown_protocol::starting_stats().unwrap();
         stats.insert("current_hp".into(), hp);
         Character {
             id: 1,
             slot: 1,
             nickname: "CombatTest".into(),
-            race: 1,
-            class: 1,
             gender: 1,
             stats,
-            inventory: vec![],
-            loot: Default::default(),
+            items: vec![],
         }
+    }
+    /// A human holding a wooden sword or, when `magical`, a wooden staff.
+    fn armed(hp: f64, magical: bool) -> Character {
+        use mortown_protocol::items::{Location, Slot, Stack};
+        let mut c = character(hp);
+        c.items = vec![Stack {
+            id: 1,
+            ..Stack::new(
+                if magical { 2 } else { 1 },
+                1,
+                Location::Worn { slot: Slot::Weapon },
+            )
+        }];
+        c
     }
     #[test]
     fn secondary_slow_expires_miss_does_not_slow_and_cooldown_survives_rejoin() {
-        for class in [1, 2] {
+        for magical in [false, true] {
             let world = Arc::new(mortown_world::World::new());
             let mut sim = Simulation::new(world.clone());
             sim.combat.random = || 0.5;
             let m = sim.monsters()[0].position;
             sim.join(1, "Slow".into(), [m[0], m[2]], 0.).unwrap();
-            let mut c = character(120.);
-            c.class = class;
-            c.stats = mortown_protocol::starting_stats(1, class).unwrap();
+            let mut c = armed(120., magical);
             sim.configure(&c);
             assert!(sim.use_secondary(1, 1).is_err());
             c.stats.insert("secondary_learned".into(), 1.);
             let before = sim.configure(&c);
             let mut empty = c.clone();
             empty.stats.insert(
-                if class == 2 {
+                if magical {
                     "current_mana"
                 } else {
                     "current_stamina"
@@ -1124,10 +1196,10 @@ mod tests {
             assert!(sim.use_secondary(1, 999).is_err());
             sim.use_secondary(1, 1).unwrap();
             let after = sim.actor(1).unwrap();
-            assert_eq!(after.mana, before.mana - if class == 2 { 8. } else { 0. });
+            assert_eq!(after.mana, before.mana - if magical { 8. } else { 0. });
             assert_eq!(
                 after.stamina,
-                before.stamina - if class == 1 { 8. } else { 0. }
+                before.stamina - if magical { 0. } else { 8. }
             );
             assert_eq!(sim.monsters()[0].slow_ms, 4000);
             assert_eq!(after.secondary_cooldown_ms, 8000);
@@ -1179,64 +1251,56 @@ mod tests {
     }
     #[test]
     fn learned_ranks_increase_damage_without_resetting_cooldown() {
-        for class in [1, 2] {
+        for magical in [false, true] {
             for rank in [1, 2, 3] {
                 let world = Arc::new(mortown_world::World::new());
                 let mut sim = Simulation::new(world);
                 sim.combat.random = || 0.5;
                 let mob = sim.monsters()[0].position;
                 sim.join(1, "Rank".into(), [mob[0], mob[2]], 0.).unwrap();
-                let mut c = character(120.);
-                c.class = class;
-                c.stats = mortown_protocol::starting_stats(1, class).unwrap();
+                let mut c = armed(120., magical);
                 c.stats.insert("skill_rank".into(), rank as f64);
                 sim.configure(&c);
                 sim.use_skill(1, 1).unwrap();
-                let skill = mortown_protocol::skills::ranked(class, rank).unwrap();
-                let attack = c.stats[if class == 2 { "m_attack" } else { "f_attack" }];
+                let skill = mortown_protocol::skills::ranked(magical, rank);
+                let attack = c.stats[if magical { "m_attack" } else { "f_attack" }];
                 assert_eq!(
                     sim.monsters()[0].hp,
                     90. - damage(attack * skill.multiplier, 10.)
                 );
-                let mut a = sim.actor(1).unwrap();
-                if rank < 3 {
-                    a.progress.level = 3;
-                    a.progress.sp = 12.;
-                    crate::economy::learn(&mut a, rank + 1).unwrap();
-                    sim.replace_actor(a);
-                }
                 assert!(sim.use_skill(1, 1).is_err());
                 assert_eq!(sim.actor(1).unwrap().skill_cooldown_ms, 2000);
             }
         }
     }
     #[test]
-    fn loot_rolls_class_weapons_and_stacks_without_equipping() {
-        for class in [1, 2] {
+    fn loot_rolls_the_killers_weapon_family_and_stacks_without_equipping() {
+        for magical in [false, true] {
             let world = Arc::new(mortown_world::World::new());
             let mut sim = Simulation::new(world);
             sim.join(1, "Loot".into(), mortown_world::SPAWN, 0.)
                 .unwrap();
-            let mut c = character(120.);
-            c.class = class;
+            let c = armed(120., magical);
             let mut actor = sim.configure(&c);
             let fighter = sim.combat.fighters.get_mut(&1).unwrap();
-            grant_reward(&mut actor, fighter, || 0.);
-            grant_reward(&mut actor, fighter, || 0.);
-            assert_eq!(actor.loot.len(), 4);
-            assert_eq!(actor.loot[&mortown_protocol::crafting::LEATHER], 2);
-            assert_eq!(actor.loot[&7], 2);
-            assert_eq!(actor.loot[&6], 2);
-            assert_eq!(actor.loot[&if class == 1 { 4 } else { 5 }], 2);
-            let mut items = mortown_protocol::items::starter(class);
-            mortown_protocol::items::include_loot(&mut items, &actor.loot);
-            mortown_protocol::items::include_loot(&mut items, &actor.loot);
-            assert_eq!(items.len(), 6);
-            assert!(items.iter().all(|i| !i.equipped));
-            assert!(mortown_protocol::items::equip(&mut items, class, 7, true).is_err());
-            mortown_protocol::items::equip(&mut items, class, if class == 1 { 4 } else { 5 }, true)
-                .unwrap();
-            assert_eq!(items.iter().filter(|i| i.equipped).count(), 1);
+            let mut grants = vec![];
+            grant_reward(&mut actor, fighter, || 0., &mut grants);
+            grant_reward(&mut actor, fighter, || 0., &mut grants);
+            let count = |kind: u8| -> u32 {
+                grants
+                    .iter()
+                    .filter(|(k, _)| *k == kind)
+                    .map(|(_, n)| n)
+                    .sum()
+            };
+            let weapon = if magical { 5 } else { 4 };
+            assert_eq!(count(mortown_protocol::crafting::LEATHER), 2);
+            assert_eq!(count(7), 2);
+            assert_eq!(count(6), 2);
+            assert_eq!(count(weapon), 2);
+            assert_eq!(count(mortown_protocol::items::COPPER), 24);
+            // Drops are queued as stacks to store; nothing is equipped or kept on the actor.
+            assert_eq!(actor.equipment.weapon, Some(if magical { 2 } else { 1 }));
         }
     }
     #[test]
@@ -1261,31 +1325,31 @@ mod tests {
                 sim.update();
             }
             let winner = sim.actor(1).unwrap();
-            assert_eq!(winner.loot.get(&7), Some(&1));
+            let grants = sim.take_grants(1);
+            assert!(grants.contains(&(7, 1)));
+            assert!(grants.contains(&(mortown_protocol::items::COPPER, 12)));
             assert_eq!(winner.progress.kills, 1);
             assert_eq!(winner.progress.level, 2);
-            assert_eq!(winner.progress.coins, 512.);
-            assert_eq!(winner.max_hp, 134.);
+            assert_eq!(winner.max_hp, 110.);
             assert_eq!(winner.hp, winner.max_hp);
-            assert!(sim.actor(2).unwrap().loot.is_empty());
+            assert!(sim.take_grants(2).is_empty());
             assert_eq!(sim.actor(2).unwrap().progress.kills, 0);
             assert!(sim.use_skill(2, 1).is_err());
             for _ in 0..50 {
                 sim.update();
             }
-            assert_eq!(sim.actor(1).unwrap().loot, winner.loot);
+            // Granted once: nothing is queued again on later ticks.
+            assert!(sim.take_grants(1).is_empty());
             assert_eq!(sim.actor(1).unwrap().progress, winner.progress);
         }
     }
     #[test]
     fn skills_validate_targets_resources_and_keep_cooldown_across_rejoin() {
-        for class in [1, 2] {
+        for magical in [false, true] {
             let world = Arc::new(mortown_world::World::new());
             let mut sim = Simulation::new(world);
             sim.combat.random = || 0.5;
-            let mut c = character(120.);
-            c.class = class;
-            c.stats = mortown_protocol::starting_stats(1, class).unwrap();
+            let c = armed(120., magical);
             sim.join(1, "Skills".into(), mortown_world::SPAWN, 0.)
                 .unwrap();
             sim.configure(&c);
@@ -1297,7 +1361,7 @@ mod tests {
             assert!(sim.use_skill(1, 999).is_err());
             let mut empty = c.clone();
             empty.stats.insert(
-                if class == 2 {
+                if magical {
                     "current_mana"
                 } else {
                     "current_stamina"
@@ -1311,16 +1375,16 @@ mod tests {
             sim.configure(&c);
             sim.use_skill(1, 1).unwrap();
             let after = sim.actor(1).unwrap();
-            let skill = mortown_protocol::skills::starter(class).unwrap();
-            let attack = c.stats[if class == 2 { "m_attack" } else { "f_attack" }];
+            let skill = mortown_protocol::skills::starter(magical);
+            let attack = c.stats[if magical { "m_attack" } else { "f_attack" }];
             assert_eq!(
                 sim.monsters()[0].hp,
                 90. - damage(attack * skill.multiplier, 10.)
             );
-            assert_eq!(after.mana, before.mana - if class == 2 { 5. } else { 0. });
+            assert_eq!(after.mana, before.mana - if magical { 5. } else { 0. });
             assert_eq!(
                 after.stamina,
-                before.stamina - if class == 1 { 5. } else { 0. }
+                before.stamina - if magical { 0. } else { 5. }
             );
             for _ in 0..100 {
                 assert!(sim.use_skill(1, 1).is_err());
@@ -1391,14 +1455,14 @@ mod tests {
             false,
         )
         .unwrap();
-        for _ in 0..200 {
+        for _ in 0..99 {
             sim.update();
         }
-        assert_eq!(sim.actor(1).unwrap().position, dead.position);
-        sim.respawn(1).unwrap();
+        assert_eq!(sim.actor(1).unwrap().hp, 0.);
+        sim.update();
         let alive = sim.actor(1).unwrap();
-        assert_eq!(alive.hp, 120.);
-        assert_eq!(alive.stamina, 115.);
+        assert_eq!(alive.position, dead.position);
+        assert_eq!(alive.hp, mortown_protocol::life::rise_hp(alive.max_hp));
         assert!(sim.respawn(1).is_err());
     }
     #[test]
@@ -1426,11 +1490,33 @@ mod tests {
         assert!(sim.monsters()[0].attack.unwrap().released);
         assert_eq!(sim.actor(1).unwrap().hp, 0.);
         assert!(sim.respawn(1).is_err());
-        for _ in 0..200 {
+        for _ in 0..99 {
             sim.update();
         }
-        sim.respawn(1).unwrap();
-        assert_eq!(sim.actor(1).unwrap().hp, 120.);
+        assert_eq!(sim.actor(1).unwrap().hp, 0.);
+        sim.update();
+        let risen = sim.actor(1).unwrap();
+        assert_eq!(risen.hp, mortown_protocol::life::rise_hp(risen.max_hp));
+    }
+    #[test]
+    fn logout_keeps_one_body_and_login_does_not_spawn_a_second() {
+        let world = Arc::new(mortown_world::World::new());
+        let mut sim = Simulation::new(world);
+        sim.join(1, "One".into(), mortown_world::SPAWN, 0.).unwrap();
+        sim.disconnect(1);
+        assert!(sim.actor(1).unwrap().offline);
+        sim.join(1, "One".into(), mortown_world::SPAWN, 0.).unwrap();
+        assert!(!sim.actor(1).unwrap().offline);
+        assert!(sim.join(1, "One".into(), mortown_world::SPAWN, 0.).is_err());
+        let mut sheet = character(100.);
+        sheet.stats.insert("bound".into(), 1.);
+        sim.configure(&sheet);
+        assert!(sim.actor(1).unwrap().bound);
+        sim.disconnect(1);
+        sim.configure(&sheet);
+        let body = sim.actor(1).unwrap();
+        assert!(body.bound);
+        assert!(body.offline);
     }
     #[test]
     fn defeated_bandit_respawns_once_and_only_after_delay() {
@@ -1521,7 +1607,7 @@ mod tests {
         actor.powers.immortal = true;
         actor.stamina = 0.;
         actor.mana = 0.;
-        actor.progress.extra_skills = 1 << 3;
+        actor.progress.extra_skills = 1;
         sim.replace_actor(actor);
         sim.attack(1, Some(1)).unwrap();
         sim.update();
@@ -1529,8 +1615,7 @@ mod tests {
         assert_eq!(sim.actor(1).unwrap().stamina, 0.);
         sim.use_skill(1, 1).unwrap();
         assert_eq!(sim.actor(1).unwrap().stamina, 0.);
-        sim.use_ability(1, mortown_protocol::skills::RACIAL_SKILL, None)
-            .unwrap();
+        sim.use_ability(1, 3, Some(1)).unwrap();
         let actor = sim.actor(1).unwrap();
         assert_eq!(actor.stamina, 0.);
         assert_eq!(actor.mana, 0.);

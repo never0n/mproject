@@ -79,20 +79,6 @@ pub(crate) async fn target(
         row.get("role"),
     ))
 }
-pub async fn mail_allowed(conn: &mut PgConnection, owner: i64) -> Result<(), String> {
-    let muted: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM global_mutes WHERE character_id=$1 AND until_at>now())",
-    )
-    .bind(owner)
-    .fetch_one(conn)
-    .await
-    .map_err(db)?;
-    if muted {
-        Err("Почта временно заблокирована общим мутом".into())
-    } else {
-        Ok(())
-    }
-}
 pub fn notice(message: impl Into<String>) -> Reply {
     Reply::Notice {
         message: message.into(),
@@ -381,18 +367,25 @@ pub async fn confirm(
             if price > maximum {
                 return Err("Цена изменилась. Повторите /heal".into());
             }
-            if a.progress.coins < f64::from(price) {
-                return Err("Не хватает монет".into());
-            }
+            let paid = mortown_protocol::items::format_coins(price.into());
             a.hp = a.max_hp;
-            a.progress.coins -= f64::from(price);
             sim.exchanges.cancel(owner, "Обмен отменён: лечение");
-            crate::store::save(conn, &a).await?;
+            crate::inventory::transaction(conn, async |tx| {
+                Ok(crate::inventory::pay(tx, &mut a, price.into(), "").await?)
+            })
+            .await
+            .map_err(|e| match e {
+                crate::store::ExchangeFailure::Rejected(e) if e == "Недостаточно монет" => {
+                    "Не хватает монет".to_string()
+                }
+                crate::store::ExchangeFailure::Rejected(e) => e,
+                crate::store::ExchangeFailure::Uncertain => {
+                    "Не удалось подтвердить оплату лечения".into()
+                }
+            })?;
             sim.replace_actor(a);
             server.admin_events.send_replace(());
-            Ok(notice(format!(
-                "Здоровье восстановлено. Оплачено {price} монет"
-            )))
+            Ok(notice(format!("Здоровье восстановлено. Оплачено {paid}")))
         }
     }
 }

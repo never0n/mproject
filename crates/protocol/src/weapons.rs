@@ -56,9 +56,14 @@ pub fn definition(item: u8) -> Option<Definition> {
         interval_scale,
     })
 }
-pub fn attack_range(item: Option<u8>, class: u8) -> f32 {
+/// Staves channel mana: they switch damage, resource and skill variants to magic.
+pub fn magical(item: Option<u8>) -> bool {
     item.and_then(definition)
-        .map_or(if class == 2 { 12. } else { 3. }, |d| d.range)
+        .is_some_and(|d| d.family == Family::Staff)
+}
+/// Bare hands fight at melee range.
+pub fn attack_range(item: Option<u8>) -> f32 {
+    item.and_then(definition).map_or(3., |d| d.range)
 }
 pub fn interval_scale(item: Option<u8>) -> f64 {
     item.and_then(definition).map_or(1., |d| d.interval_scale)

@@ -1,19 +1,29 @@
 //! Metre-based fantasy hill town. Shared terrain, street plan and oriented collision.
+//! `World::new()` deterministically builds the same map on client and server (no files, no randomness).
+//! Client uses it for rendering (`scene.rs`), picking and camera; server for movement validation.
+//! Heights: `height()` = natural terrain; `ground_height()` = drawn terrain mesh with flattened plots;
+//! `surface_height()` = what you stand on (floors, stairs, ramps, bridge). Changing collision → bump protocol `WORLD_VERSION`.
 pub mod navigation;
-pub mod npcs;
+pub mod stations;
 pub mod terrain;
 use std::f32::consts::{PI, TAU};
 use terrain::Plot;
 
+/// Map spans ±8 km on X and Z; anything outside is rejected as invalid.
 pub const WORLD_HALF: f32 = 8000.0;
+/// City layout was designed at a larger size; `city()` shrinks design coordinates by this factor
+/// (building sizes are not scaled, so people keep real proportions).
 pub const CITY_SCALE: f32 = 0.66;
 const fn city(p: [f32; 2]) -> [f32; 2] {
     [p[0] * CITY_SCALE, p[1] * CITY_SCALE]
 }
+/// Character collision radius (m): obstacles are inflated by this in all walk checks.
 pub const PLAYER_RADIUS: f32 = 0.45;
 pub const PLAZA: [f32; 2] = city([-70.0, 80.0]);
-pub const MERCHANT: [f32; 2] = [SPAWN[0] + 4., SPAWN[1]];
+/// Plaza stall counter, next to the spawn point. All points here are `[x, z]`.
+pub const PLAZA_STALL: [f32; 2] = [SPAWN[0] + 4. - 1., SPAWN[1]];
 pub const SPAWN: [f32; 2] = city([-70.0, 120.0]);
+/// City wall polygon (closed loop); `GATE_SEGMENTS` are the wall sides that have gates.
 pub const WALL: [[f32; 2]; 17] = [
     city([-580., -160.]),
     city([-530., -360.]),
@@ -35,6 +45,7 @@ pub const WALL: [[f32; 2]; 17] = [
 ];
 const GATE_SEGMENTS: [usize; 4] = [2, 8, 11, 15];
 
+/// One of the four large enterable civic buildings; `size` is [width, depth] in meters.
 #[derive(Clone, Copy)]
 pub struct HallSpec {
     pub name: &'static str,
@@ -74,13 +85,16 @@ pub const HALL_SPECS: [HallSpec; 4] = [
     },
 ];
 
+/// Smoothstep from 0 (x ≤ a) to 1 (x ≥ b); used for soft blending everywhere.
 fn smooth(a: f32, b: f32, x: f32) -> f32 {
     let t = ((x - a) / (b - a)).clamp(0., 1.);
     t * t * (3. - 2. * t)
 }
+/// Gaussian bump: 1 at the center, fading with distance (`radius` controls width).
 fn hill(x: f32, z: f32, cx: f32, cz: f32, radius: f32) -> f32 {
     (-((x - cx).powi(2) + (z - cz).powi(2)) / radius.powi(2)).exp()
 }
+/// River centerline X for a given Z: a wavy line around x = 850 m, east of the city.
 pub fn river_x(z: f32) -> f32 {
     850. + 95. * (z * 0.004).sin() + 25. * (z * 0.009).sin()
 }
@@ -106,9 +120,12 @@ pub fn noise(x: f32, z: f32, scale: f32, seed: u32) -> f32 {
 pub fn mountain_inner_radius(angle: f32) -> f32 {
     6100. + 340. * (angle * 3. + 0.4).sin() + 190. * (angle * 7. - 0.7).sin()
 }
+/// Signed distance past the mountain belt's inner edge (positive = inside the mountains).
 pub fn mountain_distance(x: f32, z: f32) -> f32 {
     x.hypot(z) - mountain_inner_radius(z.atan2(x))
 }
+/// Raw landscape: gentle town hills near the center, countryside farther out, river valley,
+/// and a mountain ring beyond 3 km.
 fn natural_height(x: f32, z: f32) -> f32 {
     let r = x.hypot(z);
     let country = 34.
@@ -126,6 +143,7 @@ fn natural_height(x: f32, z: f32) -> f32 {
         + 3.5 * hill(x, z, 240., 90., 95.)
         + 3.0 * hill(x, z, -235., 190., 90.)
         - 1.5 * hill(x, z, 15., 225., 100.);
+    // Town terrain within 500 m of the center, countryside beyond 1 km, blended between.
     let blend = smooth(500., 1000., r);
     let mut y = town * (1. - blend) + country * blend;
     let valley = (1. - smooth(20., 110., (x - river_x(z)).abs())) * (1. - smooth(4600., 5400., r));
@@ -152,17 +170,21 @@ fn natural_height(x: f32, z: f32) -> f32 {
     let roughness = (mountains / 500.).clamp(0., 1.);
     y + mountains + roughness * (110. * noise(x, z, 190., 239) + 45. * noise(x, z, 65., 157))
 }
+/// World → object-local coordinates (inverse of `rotate`), so rotated boxes can be tested axis-aligned.
 fn local(point: [f32; 2], center: [f32; 2], yaw: f32) -> [f32; 2] {
     let x = point[0] - center[0];
     let z = point[1] - center[1];
     [yaw.cos() * x - yaw.sin() * z, yaw.sin() * x + yaw.cos() * z]
 }
+/// Object-local offset (x, z) around `center` rotated by `yaw` → world `[x, z]`.
 pub fn rotate(center: [f32; 2], x: f32, z: f32, yaw: f32) -> [f32; 2] {
     [
         center[0] + yaw.cos() * x + yaw.sin() * z,
         center[1] - yaw.sin() * x + yaw.cos() * z,
     ]
 }
+/// Natural terrain plus flattened plaza and hall platforms. Not the walkable surface:
+/// use `World::surface_height` for that.
 pub fn height(x: f32, z: f32) -> f32 {
     let mut y = natural_height(x, z);
     // Only the gathering space and occupied hall floors are graded; the city itself stays hilly.
@@ -178,6 +200,7 @@ pub fn height(x: f32, z: f32) -> f32 {
     }
     y
 }
+/// Point-in-polygon test against `WALL` (ray-crossing count).
 pub fn inside_city(p: [f32; 2]) -> bool {
     let mut inside = false;
     for i in 0..WALL.len() {
@@ -202,6 +225,8 @@ pub fn nearest_on_segment(p: [f32; 2], a: [f32; 2], b: [f32; 2]) -> [f32; 2] {
     [a[0] + t * dx, a[1] + t * dz]
 }
 
+/// Collision box rotated around Y: `center`/`half`/`yaw` describe the footprint,
+/// `min`/`max` are a world-axis bounding box (Y range used for sight checks).
 #[derive(Clone, Copy, Debug)]
 pub struct Bounds {
     pub min: [f32; 3],
@@ -294,6 +319,8 @@ pub enum Shape {
     Cone,
     Arch,
 }
+/// One drawable piece of city geometry (wall, roof, column…). `detail` = small decoration;
+/// `roof_of` = hall whose interior hides this roof; `camera_solid` = camera can't pass through.
 #[derive(Clone, Debug)]
 pub struct Block {
     pub center: [f32; 3],
@@ -308,6 +335,7 @@ pub struct Block {
     /// Procedural stand-in kept for collision and camera; a reference model is drawn instead.
     pub hidden: bool,
 }
+/// Enterable interior. The first `HALL_SPECS.len()` entries are civic halls; the rest are house interiors.
 #[derive(Clone, Debug)]
 pub struct Hall {
     pub name: &'static str,
@@ -363,6 +391,7 @@ pub struct Scenery {
     pub position: [f32; 3],
     pub yaw: f32,
 }
+/// Walkable slope: height goes from `base` to `base + rise` along its `length`.
 #[derive(Clone, Copy, Debug)]
 pub struct Ramp {
     pub center: [f32; 2],
@@ -373,6 +402,8 @@ pub struct Ramp {
     pub rise: f32,
 }
 type RoadSegment = ([f32; 2], [f32; 2], f32);
+/// The whole generated map. `blocks` = what is drawn; `obstacles` = what blocks walking.
+/// They overlap but are separate lists, so a visual change may not change collision.
 #[derive(Clone, Debug)]
 pub struct World {
     pub blocks: Vec<Block>,
@@ -388,6 +419,8 @@ pub struct World {
     pub trees: Vec<Tree>,
     pub scenery: Vec<Scenery>,
     pub bridge: Option<Bridge>,
+    // Spatial indexes on a 32 m grid: which road segments / obstacles touch each cell,
+    // so collision checks don't scan every object.
     street_cells: std::collections::HashMap<(i32, i32), Vec<RoadSegment>>,
     obstacle_cells: std::collections::HashMap<(i32, i32), Vec<usize>>,
 }
@@ -397,6 +430,8 @@ impl Default for World {
     }
 }
 impl World {
+    /// Builds the entire map. Order matters: streets and plots first, then buildings that read them,
+    /// and the obstacle index last. Fairly expensive; create once and share via `Arc`.
     pub fn new() -> Self {
         let mut w = Self {
             blocks: vec![],
@@ -437,9 +472,10 @@ impl World {
         }
         w.river_bridge();
         w.market_stalls();
-        w.npc_stations();
+        w.work_stations();
         w.forest();
         w.plaza_decor();
+        // Register each obstacle in every 32 m cell its padded bounding box touches.
         for (id, b) in w.obstacles.iter().enumerate() {
             for x in ((b.min[0] - PLAYER_RADIUS) / 32.).floor() as i32
                 ..=((b.max[0] + PLAYER_RADIUS) / 32.).floor() as i32
@@ -453,6 +489,8 @@ impl World {
         }
         w
     }
+    /// Adds a block in world coordinates; `solid` also adds a collision obstacle.
+    /// Gable/cone roofs always stop the camera even if not walk-solid.
     #[allow(clippy::too_many_arguments)]
     fn piece(
         &mut self,
@@ -499,6 +537,7 @@ impl World {
             yaw,
         });
     }
+    /// Like `piece`, but `p` is an offset in a building's local frame (center `c`, ground `base`, `yaw`).
     #[allow(clippy::too_many_arguments)]
     fn part(
         &mut self,
@@ -1605,14 +1644,14 @@ impl World {
             true,
         );
     }
-    fn npc_stations(&mut self) {
-        use npcs::Role;
-        for npc in npcs::RESIDENTS {
-            let c = npc.counter_position();
-            let yaw = npc.yaw();
+    fn work_stations(&mut self) {
+        use stations::Furnishing;
+        for station in stations::STATIONS {
+            let c = station.counter_position();
+            let yaw = station.yaw();
             let base = self.surface_height(c[0], c[1]);
             self.scenery(SceneryKind::Counter, [c[0], base, c[1]], yaw);
-            if npc.hall().is_none() {
+            if station.hall().is_none() {
                 let id = self.piece(
                     [c[0], base + 0.76, c[1]],
                     [3.17, 1.52, 1.07],
@@ -1623,9 +1662,9 @@ impl World {
                 );
                 self.conceal(id);
             }
-            match npc.role {
-                Role::Smith => {
-                    let anvil = rotate(c, 0., npc.work_offset(), yaw);
+            match station.furnishing {
+                Furnishing::Smithy => {
+                    let anvil = rotate(c, 0., station.work_offset(), yaw);
                     self.scenery(SceneryKind::Anvil, [anvil[0], base, anvil[1]], yaw);
                     let id = self.piece(
                         [anvil[0], base + 0.76, anvil[1]],
@@ -1637,13 +1676,13 @@ impl World {
                     );
                     self.blocks[id].hidden = true;
                     self.blocks[id].camera_solid = false;
-                    let forge = rotate(c, 0., npc.work_offset() - 2.4, yaw);
+                    let forge = rotate(c, 0., station.work_offset() - 2.4, yaw);
                     self.scenery(SceneryKind::Forge, [forge[0], base, forge[1]], yaw);
-                    let sign = rotate(c, 2.15, npc.work_offset(), yaw);
+                    let sign = rotate(c, 2.15, station.work_offset(), yaw);
                     self.scenery(SceneryKind::BlacksmithSign, [sign[0], base, sign[1]], yaw);
                 }
-                Role::Merchant => {
-                    let crates = rotate(c, -2.2, npc.work_offset(), yaw);
+                Furnishing::Market => {
+                    let crates = rotate(c, -2.2, station.work_offset(), yaw);
                     self.scenery(SceneryKind::Crates, [crates[0], base, crates[1]], yaw);
                 }
                 _ => {}
@@ -1706,6 +1745,7 @@ impl World {
         if self.obstacles.iter().any(|o| o.blocks_sight(a, b)) {
             return false;
         }
+        // Terrain occlusion: sample every 0.5 m; the line must stay 5 cm above the surface.
         let steps = (distance([a[0], a[2]], [b[0], b[2]]) / 0.5).ceil().max(1.) as usize;
         (0..=steps).all(|i| {
             let t = i as f32 / steps as f32;
@@ -1713,6 +1753,8 @@ impl World {
             p[1] > self.surface_height(p[0], p[2]) + 0.05
         })
     }
+    /// Height of whatever you stand on at (x, z), checked in priority order: bridge deck,
+    /// civic hall floor (1.2 m above its platform) and entrance steps, house floors, ramps, terrain.
     pub fn surface_height(&self, x: f32, z: f32) -> f32 {
         if let Some(b) = &self.bridge
             && (x - b.center[0]).abs() <= 55.0001
@@ -1726,6 +1768,8 @@ impl World {
             if p[0].abs() <= h.half[0] && p[1].abs() <= h.half[1] {
                 return level;
             }
+            // Entrance stairs: 12 m wide, six 1 m treads dropping 0.2 m each, 4–10 m outside the door.
+            // The 0.0001 tolerances keep exact edge points inside despite float rounding.
             if p[0].abs() <= 6.0001
                 && p[1] >= h.half[1] + 4. - 0.0001
                 && p[1] <= h.half[1] + 10. + 0.0001
@@ -1733,6 +1777,7 @@ impl World {
                 let step = (p[1] - h.half[1] - 4.).floor().clamp(0., 5.);
                 return level - step * 0.2;
             }
+            // Landing just outside the door, at floor level (wider on the side ramp's side).
             if (-10. ..=18.).contains(&p[0]) && (h.half[1]..=h.half[1] + 4.).contains(&p[1]) {
                 return level;
             }
@@ -1752,6 +1797,8 @@ impl World {
         }
         self.ground_height(x, z)
     }
+    /// Can a character stand here: inside the map, not in an obstacle (inflated by `PLAYER_RADIUS`),
+    /// not in the river (except on the bridge), not in the mountains, and terrain slope below 0.8.
     pub fn walkable(&self, x: f32, z: f32) -> bool {
         if !x.is_finite()
             || !z.is_finite()
@@ -1788,10 +1835,13 @@ impl World {
         {
             return true;
         }
+        // Slope from central differences over ±1 m; 0.8 rise per meter ≈ 39°.
         let dx = (self.ground_height(x + 1., z) - self.ground_height(x - 1., z)) / 2.;
         let dz = (self.ground_height(x, z + 1.) - self.ground_height(x, z - 1.)) / 2.;
         dx.hypot(dz) < 0.8
     }
+    /// The core movement rule (client and server): can a character walk straight from `a` to `b`?
+    /// Exact sweep against obstacles, then samples every 0.35 m for walkability and step height.
     pub fn segment_clear(&self, a: [f32; 2], b: [f32; 2]) -> bool {
         if a.into_iter()
             .chain(b)
@@ -1816,11 +1866,13 @@ impl World {
             let x = a[0] + (b[0] - a[0]) * t;
             let z = a[1] + (b[1] - a[1]) * t;
             let y = self.surface_height(x, z);
+            // Max climb between samples: 0.32 m (stair treads are 0.2 m; walls/ledges are taller).
             let step_ok = (y - previous).abs() <= 0.32;
             previous = y;
             step_ok && self.walkable(x, z)
         })
     }
+    /// Index in `halls` of the interior containing (x, z), if any.
     pub fn hall_at(&self, x: f32, z: f32) -> Option<usize> {
         self.halls.iter().position(|h| {
             let p = local([x, z], h.center, h.yaw);
@@ -1852,7 +1904,7 @@ mod reference_city {
                 .iter()
                 .filter(|item| item.kind == SceneryKind::Counter)
                 .count(),
-            npcs::RESIDENTS.len()
+            stations::STATIONS.len()
         );
         assert!(
             world

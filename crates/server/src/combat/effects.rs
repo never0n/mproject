@@ -13,8 +13,6 @@ pub struct Effects {
     pub blind_until: u64,
     pub cripple_until: u64,
     pub sand_until: u64,
-    pub stun_until: u64,
-    pub corroded_until: u64,
     pub dots: Vec<Dot>,
 }
 impl Effects {
@@ -36,8 +34,6 @@ impl Effects {
             (StatusKind::Blinded, self.blind_until),
             (StatusKind::Crippled, self.cripple_until),
             (StatusKind::Quicksand, self.sand_until),
-            (StatusKind::Stunned, self.stun_until),
-            (StatusKind::Corroded, self.corroded_until),
         ]
         .into_iter()
         .chain(self.dots.iter().map(|d| (d.kind, d.until)))
@@ -71,12 +67,5 @@ impl Effects {
     pub fn accuracy_multiplier(&self, tick: u64) -> f64 {
         (if self.blind_until > tick { 0.2 } else { 1. })
             * (if self.sand_until > tick { 0.7 } else { 1. })
-    }
-    pub fn defence(&self, class: u8, tick: u64, base: f64) -> f64 {
-        if class == 1 && self.corroded_until > tick {
-            0.
-        } else {
-            base
-        }
     }
 }

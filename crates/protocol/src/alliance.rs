@@ -1,10 +1,44 @@
+//! Alliance (guild) wire types: roles, commands, member list and invitations.
+//! Rules and DB work live in `server/src/alliance.rs`; UI in `client/src/alliance.rs`.
 use serde::{Deserialize, Serialize};
 
+/// Max members, creation price (coins), invitation lifetime (s).
 pub const LIMIT: usize = 20;
-pub const CREATE_COST: f64 = 1000.;
+pub const CREATE_COST: u64 = 1000;
 pub const INVITE_SECONDS: u32 = 120;
-pub const STORAGE_SLOTS: usize = 50;
 
+/// [CANON] one membership per type. The full classifier is still open; these three are named.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum Kind {
+    Faction,
+    #[default]
+    Guild,
+    Order,
+}
+impl Kind {
+    pub fn code(self) -> i16 {
+        match self {
+            Self::Faction => 1,
+            Self::Guild => 2,
+            Self::Order => 3,
+        }
+    }
+    pub fn parse(code: i16) -> Self {
+        match code {
+            1 => Self::Faction,
+            3 => Self::Order,
+            _ => Self::Guild,
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Faction => "Фракция",
+            Self::Guild => "Гильдия",
+            Self::Order => "Орден",
+        }
+    }
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Role {
@@ -34,6 +68,8 @@ pub enum Command {
     Refresh,
     Create {
         name: String,
+        #[serde(default)]
+        kind: Kind,
     },
     Invite {
         alliance: i64,
@@ -64,17 +100,6 @@ pub enum Command {
     Dissolve {
         alliance: i64,
     },
-    Deposit {
-        alliance: i64,
-        revision: i64,
-        item: crate::mail::AttachmentRequest,
-    },
-    Withdraw {
-        alliance: i64,
-        revision: i64,
-        entry: i64,
-        quantity: u32,
-    },
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Member {
@@ -88,29 +113,9 @@ pub struct Member {
 pub struct View {
     pub id: i64,
     pub name: String,
+    #[serde(default)]
+    pub kind: Kind,
     pub members: Vec<Member>,
-    pub storage: Storage,
-}
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct Storage {
-    pub revision: i64,
-    pub entries: Vec<StorageEntry>,
-    pub history: Vec<StorageEvent>,
-}
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct StorageEntry {
-    pub id: i64,
-    pub slot: usize,
-    pub kind: u8,
-    pub quantity: u32,
-}
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct StorageEvent {
-    pub nickname: String,
-    pub deposit: bool,
-    pub kind: u8,
-    pub quantity: u32,
-    pub time: String,
 }
 impl View {
     pub fn role(&self, owner: i64) -> Option<Role> {
@@ -129,6 +134,9 @@ pub struct Invitation {
 pub struct Reply {
     pub response: bool,
     pub alliance: Option<View>,
+    /// Every current membership. A combat party is not one of these.
+    #[serde(default)]
+    pub organizations: Vec<View>,
     pub invitation: Option<Invitation>,
     pub message: String,
 }

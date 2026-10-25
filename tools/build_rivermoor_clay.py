@@ -124,7 +124,7 @@ print('Core sculpt:',len(skin.data.vertices),'vertices')
 # Studio camera, saved with a useful working viewport.
 def aim(o,point): o.rotation_euler=(Vector(point)-o.location).to_track_quat('-Z','Y').to_euler()
 camdata=bpy.data.cameras.new('Hero 3-quarter'); cam=bpy.data.objects.new('Camera • hero',camdata); studio.objects.link(cam)
-cam.location=(6,-10,5.1); aim(cam,(0,.25,1.85)); camdata.type='ORTHO'; camdata.ortho_scale=5.1; scene.camera=cam
+cam.location=(-7.6,-10,4.6); aim(cam,(-.05,.20,1.90)); camdata.type='ORTHO'; camdata.ortho_scale=4.85; scene.camera=cam
 bpy.ops.mesh.primitive_plane_add(size=200)
 floor=put(bpy.context.object,ground,studio); floor.name='Infinite studio floor'; floor.location.z=-.025
 def light(name,loc,power,size):
@@ -140,7 +140,7 @@ scene.render.image_settings.file_format='PNG'
 try: scene.render.engine='CYCLES'
 except TypeError: pass
 if scene.render.engine=='CYCLES':
-    scene.cycles.samples=48; scene.cycles.use_denoising=True
+    scene.cycles.samples=48; scene.cycles.use_denoising=False
 for area in bpy.context.screen.areas:
     if area.type=='VIEW_3D':
         area.spaces.active.region_3d.view_perspective='CAMERA'

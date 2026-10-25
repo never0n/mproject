@@ -1,0 +1,6 @@
+{
+  "median_constraint_error_px": 0.19931186888994468,
+  "p90_constraint_error_px": 0.6908930600041798,
+  "max_displacement_world": 0.18252075812609939,
+  "note": "Deformation constraint residual, not independent likeness validation."
+}

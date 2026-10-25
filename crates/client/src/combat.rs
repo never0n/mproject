@@ -9,7 +9,6 @@ use mortown_protocol::{ClientMessage, monsters::Kind};
 pub struct CombatUi {
     pub selected: Option<u32>,
     pub player: Option<i64>,
-    pub npc: Option<u8>,
 }
 #[derive(Component)]
 pub struct CombatText;
@@ -76,7 +75,6 @@ pub fn input(
             .map_or(0, |i| (i + 1) % candidates.len());
         ui.selected = Some(candidates[index].id);
         ui.player = None;
-        ui.npc = None;
     }
     let pressed = buttons
         .iter()
@@ -95,7 +93,7 @@ pub fn input(
     } else {
         pressed
     };
-    if (ui.player.is_some() || ui.npc.is_some())
+    if ui.player.is_some()
         && matches!(
             action,
             Some(Action::Attack | Action::Skill | Action::Secondary)
@@ -136,8 +134,7 @@ pub fn input(
                 ui.selected = Some(m.id);
                 let target = [m.position[0], m.position[2]];
                 let distance = mortown_world::distance(from, target);
-                let class = network.character.as_ref().map_or(1, |c| c.class);
-                let range = mortown_protocol::weapons::attack_range(actor.equipment.weapon, class);
+                let range = mortown_protocol::weapons::attack_range(actor.equipment.weapon);
                 let stand_off = (range * 0.75).max(1.5);
                 let to = if distance > stand_off {
                     [
@@ -168,10 +165,20 @@ pub fn display(
 ) {
     let selected = network.monsters.iter().find(|m| Some(m.id) == ui.selected);
     text.0 = if let Some(a) = network.authoritative.as_ref() {
-        if a.hp <= 0. {
+        if a.downed {
             format!(
-                "Вы погибли · Возрождение через {} с\n{}",
+                "Вы без сознания · подъём через {} с\n{}",
                 a.respawn_seconds, network.status
+            )
+        } else if a.hunger >= 80. || a.thirst >= 80. {
+            format!(
+                "Голод {:.0} · жажда {:.0}\n{}",
+                a.hunger, a.thirst, network.status
+            )
+        } else if a.return_seconds > 0 {
+            format!(
+                "Новая личность · уйти можно через {} с\n{}",
+                a.return_seconds, network.status
             )
         } else {
             let target = selected

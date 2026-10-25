@@ -36,8 +36,6 @@ jobs:
             target/debug/mortown-server
             target/debug/mortown-server.exe
             compose.yaml
-            docs/NETWORK.md
-            README.md
             target/debug/assets/**
 
   network:

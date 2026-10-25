@@ -1,19 +1,29 @@
+//! Draggable windows. At startup `setup` gives every HUD panel and overlay frame a thin
+//! title strip (`Handle`); `input` moves the window while that strip is held.
+//! `DragState::blocked` tells world clicks (`main::click_destination`, target, actionbar)
+//! to ignore the mouse during a drag.
 use crate::{Movement, ui};
 use bevy::{prelude::*, window::PrimaryWindow};
+/// Opt-out marker: HUD panels with it never get a drag handle (e.g. the chat).
 #[derive(Component)]
 pub struct Fixed;
+/// Window root that can be dragged.
 #[derive(Component, Default)]
 pub struct Movable;
+/// Title strip button; holds the window entity it drags.
 #[derive(Component)]
 pub struct Handle(pub Entity);
 #[derive(Resource, Default)]
 pub struct DragState {
     pub active: bool,
+    /// True during a drag and for one frame after release, so the mouse-up is not a ground click.
     pub blocked: bool,
     target: Option<Entity>,
     last: Vec2,
 }
 
+/// Must run after every window's own `setup` (last in the Startup UI chain).
+/// A new overlay must be added to `overlays` here and in `skin::setup`.
 pub fn setup(
     mut commands: Commands,
     hud: Query<Entity, (With<ui::Hud>, Without<Fixed>, Without<crate::menu::Gear>)>,
@@ -23,22 +33,18 @@ pub fn setup(
             With<ui::CharacterOverlay>,
             With<crate::inventory::InventoryOverlay>,
             With<crate::skills::Overlay>,
-            With<crate::trade::TradeOverlay>,
             With<crate::crafting::Overlay>,
-            With<crate::journal::Overlay>,
-            With<crate::dialogue::Overlay>,
             With<crate::alliance::Overlay>,
-            With<crate::warehouse::Overlay>,
             With<crate::exchange::Overlay>,
         )>,
     >,
-    mail: Query<(&crate::mail::Section, &Children)>,
     lobby: Query<Entity, With<crate::lobby::Panel>>,
     bar: Query<&Children, With<crate::actionbar::Bar>>,
     target: Query<Entity, Or<(With<crate::target::Panel>, With<crate::party::Root>)>>,
     icons: Res<crate::actionbar::Icons>,
 ) {
     commands.init_resource::<DragState>();
+    // Overlays are full-screen dimmers; the draggable frame is their first child.
     let mut targets: Vec<Entity> = hud
         .iter()
         .chain(lobby.iter())
@@ -51,13 +57,6 @@ pub fn setup(
     }
     for children in &overlays {
         if let Some(e) = children.first() {
-            targets.push(*e);
-        }
-    }
-    for (section, children) in &mail {
-        if matches!(section, crate::mail::Section::Overlay)
-            && let Some(e) = children.first()
-        {
             targets.push(*e);
         }
     }
@@ -84,11 +83,14 @@ pub fn setup(
                 BackgroundColor(Color::srgba(0.6, 0.47, 0.23, 0.25)),
             ))
             .with_children(|b| {
+                // `skin::setup` later blanks this text and makes the strip transparent.
                 b.spawn(crate::actionbar::label("⋮⋮⋮", &icons.1, 10.));
             });
         });
     }
 }
+/// Moves a window along one axis, keeping whichever edge it was anchored to
+/// (left/top or right/bottom). Percent anchors are converted to pixels on first drag.
 fn shift(near: &mut Val, far: &mut Val, delta: f32, extent: f32) {
     match (*near, *far) {
         (Val::Percent(n), _) => *near = px(extent * n / 100. + delta),
@@ -98,6 +100,7 @@ fn shift(near: &mut Val, far: &mut Val, delta: f32, extent: f32) {
         _ => *near = px(delta),
     }
 }
+/// Runs before world-click systems in the Update chain so `blocked` is fresh.
 pub fn input(
     mut drag: ResMut<DragState>,
     mouse: Res<ButtonInput<MouseButton>>,
@@ -116,17 +119,20 @@ pub fn input(
     let Some(cursor) = window.cursor_position() else {
         return;
     };
+    // Work in UI units (logical pixels divided by `UiScale`), the same units as `Node` offsets.
     let cursor = cursor / ui_scale.0;
     let extent = Vec2::new(window.width(), window.height()) / ui_scale.0;
     if mouse.just_pressed(MouseButton::Left)
         && let Some((handle, _, _)) = handles
             .iter()
+            // Zero size = the window is hidden.
             .find(|(_, i, n)| **i == Interaction::Pressed && n.size().min_element() > 0.)
     {
         drag.target = Some(handle.0);
         drag.last = cursor;
         drag.active = true;
         drag.blocked = true;
+        // Grabbing a window stops the hero's current route.
         *movement = Movement::default();
     }
     let Some(target) = drag.target else {
@@ -134,9 +140,11 @@ pub fn input(
     };
     if let Ok((mut node, computed, transform)) = windows.get_mut(target) {
         let mut delta = cursor - drag.last;
+        // Computed layout is in physical pixels; convert to UI units.
         let scale = computed.inverse_scale_factor();
         let center = transform.transform_point2(Vec2::ZERO) * scale;
         let size = computed.size() * scale;
+        // Keep 40 px visible left/right, the top edge on screen and 16 px above the bottom.
         let min = Vec2::new(40. - size.x / 2., size.y / 2.);
         let max = Vec2::new(extent.x - 40. + size.x / 2., extent.y - 16. + size.y / 2.);
         let next = (center + delta).clamp(min, max.max(min));

@@ -1,0 +1,13 @@
+Reference portrait v2
+
+Open reference_portrait_v2.blend. The supplied reference image is packed into the file.
+The presentation scene includes front, profile and three-quarter cameras.
+The hidden Sculpt source collection retains the editable quad cage and likeness shape key.
+Hair, beard, eyebrows, sclera, irises, pupils, corneas and lid menisci are separate objects.
+Scene unit scale: 0.1 (one Blender unit is 10 cm).
+
+Limitations: approximate likeness, reference-projected skin includes baked photographic lighting; no facial rig or game optimization.
+Base topology: MakeHuman human_base.obj, explicitly CC0 September 2020 per its file header.
+Reference: supplied by the user.
+
+Construction order: init_v2.py, surface_v2.py, groom_v2.py, polish_v2.py, finalize_v2.py, eye_finish_v2.py, release_v2.py, fit_lids_v2.py. Scripts use absolute local paths and are for reconstruction/debugging; the final blend does not require them.

@@ -241,7 +241,6 @@ pub fn input(
                 // Offline rows are selectable for group management, never as world targets.
                 if m.online {
                     target.selected = None;
-                    target.npc = None;
                     target.player = Some(m.id);
                     selection.world_target = Some(m.id);
                     network.action(mortown_protocol::ClientMessage::Attack { target: None });
@@ -376,7 +375,7 @@ pub fn display(
         Display::None
     };
     rules.0 = format!(
-        "НАГРАДЫ В ГРУППЕ\n\nГруппа добившего врага получает награду. Учитываются живые участники в {} м от врага на момент его гибели.\n\nОпыт и монеты — поровну, остаток переходит по очереди. Предметы — по очереди. Задание засчитывается каждому получателю.\n\nПосле выхода из мира место сохраняется {} мин. Вернитесь тем же персонажем. Лидерство переходит участнику в игре.\n\nПоследняя добыча:\n{}",
+        "НАГРАДЫ В ГРУППЕ\n\nГруппа добившего врага получает награду. Учитываются живые участники в {} м от врага на момент его гибели.\n\nОпыт и монеты — поровну, остаток переходит по очереди. Предметы — по очереди.\n\nПосле выхода из мира место сохраняется {} мин. Вернитесь тем же персонажем. Лидерство переходит участнику в игре.\n\nПоследняя добыча:\n{}",
         mortown_protocol::party::REWARD_RANGE as u32,
         mortown_protocol::party::RECONNECT_SECONDS / 60,
         group

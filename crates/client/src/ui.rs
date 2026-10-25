@@ -1,6 +1,9 @@
+//! Core HUD and the character sheet. `setup` spawns the hero panel (portrait, HP/SP/MP, exp bar),
+//! the location panel and the hidden "Характеристики" overlay; `update` refreshes them from
+//! `Network` every frame. Also owns the colour palette, the `CharacterWindow` resource that
+//! every other window module reads, and generic button hover colours.
 use crate::{Movement, Player, Terrain, network::Network};
 use bevy::prelude::*;
-use mortown_protocol::{CLASSES, RACES};
 
 // Mortown: charcoal steel, warm parchment and restrained brass.
 pub const GOLD: Color = Color::srgb(0.78, 0.66, 0.43);
@@ -8,40 +11,45 @@ pub const INK: Color = Color::srgb(0.86, 0.89, 0.90);
 pub const PANEL: Color = Color::srgb(0.065, 0.083, 0.10);
 pub const EDGE: Color = Color::srgb(0.25, 0.29, 0.32);
 pub const BUTTON: Color = Color::srgb(0.10, 0.13, 0.15);
+/// Hero face image in the top-left panel; filled by `inventory.rs`.
 #[derive(Component)]
 pub struct Portrait;
+/// Always-on HUD panel: shown only while playing, and clicks on it never reach the ground.
 #[derive(Component)]
 pub struct Hud;
+/// Any UI node that should swallow world clicks (checked in `main::click_destination`).
 #[derive(Component)]
 pub struct WorldInputBlocker;
+/// Which windows are open; shared by all window modules.
+/// `open` is "a side window is open"; `inventory`/`skills` pick which one
+/// (all false = character sheet). The other flags are independent windows.
 #[derive(Resource, Default)]
 pub struct CharacterWindow {
     pub open: bool,
     pub inventory: bool,
-    pub trading: bool,
     pub skills: bool,
-    pub mail: bool,
     pub menu: bool,
-    pub journal: bool,
-    pub dialogue: bool,
-    pub npc: Option<u8>,
     pub alliance: bool,
 }
 #[derive(Component)]
 pub struct CharacterOverlay;
 #[derive(Component)]
 pub struct CharacterDetails;
+/// Text cells of the character sheet, refreshed by `character_cards`.
 #[derive(Component)]
 pub enum DetailKind {
     Battle(&'static str),
     Primary(&'static str, &'static str),
     Footer,
 }
+/// Attribute button on the sheet; holds the stat key it raises.
 #[derive(Component)]
 pub struct SpendAttribute(&'static str);
+/// Menu entry that opens the character sheet (spawned in `menu.rs`).
 #[derive(Component)]
 pub struct ToggleCharacter;
 
+/// Text labels refreshed by `update`. `Players` lives in the menu popup, `Journal` in the chat.
 #[derive(Component)]
 pub enum Readout {
     Hero,
@@ -51,8 +59,11 @@ pub enum Readout {
     Journal,
     Meter(usize),
 }
+/// Coloured bar whose width is current/max of `METERS[i]`.
 #[derive(Component)]
 pub struct Fill(usize);
+// Index = meter id used by `Fill`/`Readout::Meter`: 0 exp, 1 hp, 2 stamina, 3 mana.
+// Entries: label, current-value stat key, max-value stat key, colour.
 const METERS: [(&str, &str, &str, Color); 4] = [
     ("Опыт", "current_exp", "exp", Color::srgb(0.53, 0.53, 0.53)),
     (
@@ -85,6 +96,7 @@ fn text(value: &str, font: &Handle<Font>, size: f32, color: Color) -> impl Bundl
         TextColor(color),
     )
 }
+/// Absolutely positioned HUD box; pass `Val::Auto` for the edges it should not stick to.
 fn panel(left: Val, right: Val, top: Val, bottom: Val, width: Val) -> impl Bundle {
     (
         Hud,
@@ -106,8 +118,10 @@ fn panel(left: Val, right: Val, top: Val, bottom: Val, width: Val) -> impl Bundl
         BorderColor::all(EDGE),
     )
 }
+/// First UI setup in the Startup chain; other modules query `Hud`, `Portrait` and the overlay.
 pub fn setup(mut commands: Commands, mut fonts: ResMut<Assets<Font>>) {
     commands.init_resource::<CharacterWindow>();
+    // Font is embedded in the binary so Cyrillic text renders even without the assets folder.
     let font = fonts.add(
         Font::try_from_bytes(include_bytes!("../../../assets/fonts/DejaVuSans.ttf").to_vec())
             .unwrap(),
@@ -116,6 +130,7 @@ pub fn setup(mut commands: Commands, mut fonts: ResMut<Assets<Font>>) {
         .spawn((
             panel(px(18), Val::Auto, px(18), Val::Auto, px(286)),
             crate::target::SelfPanel,
+            // Clickable: selects yourself as the target (see `target.rs`).
             Button,
         ))
         .with_children(|p| {
@@ -166,6 +181,7 @@ pub fn setup(mut commands: Commands, mut fonts: ResMut<Assets<Font>>) {
                 })
                 .with_children(|stats| {
                     stats.spawn((Readout::Hero, text("Путешественник", &font, 15., INK)));
+                    // Display order HP, MP, SP; the number is the `METERS` index.
                     for (i, color) in [
                         (1, Color::srgb(0.65, 0.23, 0.27)),
                         (3, Color::srgb(0.22, 0.43, 0.66)),
@@ -246,6 +262,7 @@ pub fn setup(mut commands: Commands, mut fonts: ResMut<Assets<Font>>) {
                 ..default()
             },
             BackgroundColor(Color::srgba(0.01, 0.02, 0.03, 0.18)),
+            // Above the HUD panels.
             GlobalZIndex(10),
         ))
         .with_children(|root| {
@@ -323,6 +340,7 @@ pub fn setup(mut commands: Commands, mut fonts: ResMut<Assets<Font>>) {
             });
         });
 }
+/// Late in the Update chain, after movement, so readouts show this frame's state.
 pub fn update(
     world: Res<Terrain>,
     player: Single<&Transform, With<Player>>,
@@ -342,6 +360,7 @@ pub fn update(
     let c = network.character.as_ref();
     let stat = |key: &str| c.and_then(|c| c.stats.get(key)).copied().unwrap_or(0.);
     let p = player.translation;
+    // Location name: inside a hall > within 85 m of the plaza centre > city > outskirts.
     let location = if let Some(id) = world.0.hall_at(p.x, p.z) {
         world.0.halls[id].name
     } else if (p.x - mortown_world::PLAZA[0]).hypot(p.z - mortown_world::PLAZA[1]) < 85. {
@@ -393,7 +412,7 @@ pub fn update(
                         } else {
                             match *i {
                                 1 => "HP",
-                                2 => "SP",
+                                2 => "Вын",
                                 _ => "MP",
                             }
                         },
@@ -415,6 +434,7 @@ pub fn update(
         });
     }
 }
+/// Default hover/press colours for every `Button` except those marked `skin::OwnStyle`.
 #[allow(clippy::type_complexity)]
 pub fn button_feedback(
     mut buttons: Query<
@@ -440,6 +460,8 @@ pub fn button_feedback(
     }
 }
 
+/// Sends `SpendAttribute` when the sheet is the visible window, online, with a free point,
+/// and no other request is in flight. The server applies it and replies with the new stats.
 pub fn spend_attribute(
     state: Res<CharacterWindow>,
     mut network: ResMut<Network>,
@@ -447,12 +469,8 @@ pub fn spend_attribute(
 ) {
     if !state.open
         || state.inventory
-        || state.trading
         || state.skills
-        || state.mail
         || state.menu
-        || state.journal
-        || state.dialogue
         || state.alliance
         || network.pending
         || network.mode != crate::network::Mode::Online
@@ -471,6 +489,7 @@ pub fn spend_attribute(
                 .and_then(|c| c.stats.get(*key))
                 .copied()
             {
+                // `expected` = value we see now; the server rejects a stale double click.
                 network.request(mortown_protocol::ClientMessage::SpendAttribute {
                     stat: (*key).into(),
                     expected: expected as u32,
@@ -481,6 +500,8 @@ pub fn spend_attribute(
     }
 }
 
+/// Opens/closes the character sheet with C or the menu entry; Escape closes it.
+/// Hidden while a full-screen window (menu, alliance) is open.
 pub fn character_window(
     mut state: ResMut<CharacterWindow>,
     mut keys: ResMut<ButtonInput<KeyCode>>,
@@ -490,9 +511,7 @@ pub fn character_window(
     mut overlay: Single<&mut Node, With<CharacterOverlay>>,
     mut details: Single<&mut Text, With<CharacterDetails>>,
 ) {
-    if (state.mail || state.menu || state.journal || state.dialogue || state.alliance)
-        && network.playing()
-    {
+    if (state.menu || state.alliance) && network.playing() {
         overlay.display = Display::None;
         return;
     }
@@ -500,12 +519,13 @@ pub fn character_window(
         state.open = false;
     } else if state.open && keys.just_pressed(KeyCode::Escape) {
         state.open = false;
+        // Consume Escape so systems later in the chain don't also react to it.
         keys.clear_just_pressed(KeyCode::Escape);
     } else if keys.just_pressed(KeyCode::KeyC) || buttons.iter().any(|i| *i == Interaction::Pressed)
     {
-        state.open = !state.open || state.inventory || state.trading || state.skills;
+        // From inventory/skills, C switches to the sheet instead of closing.
+        state.open = !state.open || state.inventory || state.skills;
         state.inventory = false;
-        state.trading = false;
         state.skills = false;
         if state.open {
             movement.path.clear();
@@ -514,12 +534,12 @@ pub fn character_window(
             movement.status = "Маршрут остановлен".into();
         }
     }
-    overlay.display = if state.open && !state.inventory && !state.trading && !state.skills {
+    overlay.display = if state.open && !state.inventory && !state.skills {
         Display::Flex
     } else {
         Display::None
     };
-    if !state.open || state.inventory || state.trading || state.skills {
+    if !state.open || state.inventory || state.skills {
         return;
     }
     let Some(c) = network.character.as_ref() else {
@@ -527,14 +547,19 @@ pub fn character_window(
         return;
     };
     let v = |k: &str| c.stats.get(k).copied().unwrap_or(0.);
+    let weapon = mortown_protocol::items::EquipmentAppearance::from_items(&c.items)
+        .weapon
+        .and_then(mortown_protocol::weapons::definition)
+        .map_or("без оружия", |w| w.name);
     details.0 = format!(
-        "{} · Уровень {:.0}\n{} · {}",
+        "{} · Уровень {:.0}\nЧеловек · {}",
         c.nickname,
         v("level"),
-        RACES[(c.race - 1) as usize],
-        CLASSES[(c.class - 1) as usize]
+        weapon
     );
 }
+/// Right-hand column of combat numbers; `prefix` is "f" (physical) or "m" (magical).
+/// Line order must match the label column spawned in `setup`.
 pub fn battle_details(c: &mortown_protocol::Character, prefix: &str) -> String {
     let n = |key: &str| {
         c.stats
@@ -566,11 +591,12 @@ pub fn character_cards(network: Res<Network>, mut labels: Query<(&DetailKind, &m
                 if v("stat_point") >= 1. { "   +" } else { "" }
             ),
             DetailKind::Footer => format!(
-                "Очки характеристик  {:.0}     ·     Очки навыков  {:.0}",
+                "Очки характеристик  {:.0}     ·     Очки талантов  {:.0}",
                 v("stat_point"),
-                v("sp")
+                v("talent_point")
             ),
         };
+        // Write only on change to avoid re-laying out text every frame.
         if text.0 != value {
             text.0 = value;
         }
@@ -601,12 +627,9 @@ mod tests {
             id: 1,
             slot: 1,
             nickname: "Проверка".into(),
-            race: 1,
-            class: 1,
             gender: 1,
-            stats: mortown_protocol::starting_stats(1, 1).unwrap(),
-            inventory: mortown_protocol::items::starter(1),
-            loot: Default::default(),
+            stats: mortown_protocol::starting_stats().unwrap(),
+            items: vec![],
         });
         app.world_mut()
             .resource_mut::<ButtonInput<KeyCode>>()
@@ -618,6 +641,7 @@ mod tests {
             .single(app.world())
             .unwrap();
         assert!(details.0.contains("Проверка"));
+        assert!(details.0.contains("Человек · без оружия"));
         let battle = battle_details(
             app.world()
                 .resource::<Network>()
@@ -626,7 +650,7 @@ mod tests {
                 .unwrap(),
             "f",
         );
-        assert!(battle.ends_with("12.0%\n×1.58"));
+        assert!(battle.ends_with("10.0%\n×1.50"));
         app.world_mut()
             .resource_mut::<ButtonInput<KeyCode>>()
             .clear();

@@ -131,7 +131,6 @@ pub fn input(
     if !drag.blocked && panels.iter().any(|i| *i == Interaction::Pressed) {
         ui.selected = None;
         ui.player = id;
-        ui.npc = None;
         network.action(mortown_protocol::ClientMessage::Attack { target: None });
     }
 }
@@ -145,7 +144,7 @@ pub fn display(
     mut casting: Single<&mut Text, (With<Casting>, Without<Meter>, Without<Title>)>,
     mut fills: Query<(&Fill, &mut Node), (Without<Panel>, Without<Resources>)>,
 ) {
-    casting.0 = if network.mode == Mode::Online && ui.player.is_none() && ui.npc.is_none() {
+    casting.0 = if network.mode == Mode::Online && ui.player.is_none() {
         network
             .monsters
             .iter()
@@ -161,7 +160,7 @@ pub fn display(
         String::new()
     };
     let mut pools = [None; 3];
-    let mut npc = false;
+    let mut monster = false;
     let name = if network.mode != Mode::Online {
         None
     } else if let Some(id) = ui.player {
@@ -171,17 +170,8 @@ pub fn display(
             .find(|a| a.id == id)
             .or_else(|| network.authoritative.as_ref().filter(|a| a.id == id));
         actor.map(|a| format!("{} · Уровень {}", a.nickname, a.progress.level))
-    } else if let Some(id) = ui.npc {
-        npc = true;
-        pools[0] = network
-            .residents
-            .iter()
-            .find(|n| n.id == id)
-            .map(|n| (n.hp, 100.));
-        crate::npcs::resolve(&network, id)
-            .map(|n| format!("{} · Уровень 1\n{}", n.name, n.role.title()))
     } else if let Some(m) = network.monsters.iter().find(|m| Some(m.id) == ui.selected) {
-        npc = true;
+        monster = true;
         pools = [Some((m.hp, m.max_hp)), m.mana, m.stamina];
         Some(format!("{} · Уровень {}", m.name, m.level))
     } else {
@@ -190,14 +180,17 @@ pub fn display(
     if name.is_none() {
         ui.selected = None;
         ui.player = None;
-        ui.npc = None;
     }
     root.display = if name.is_some() {
         Display::Flex
     } else {
         Display::None
     };
-    resources.display = if npc { Display::Flex } else { Display::None };
+    resources.display = if monster {
+        Display::Flex
+    } else {
+        Display::None
+    };
     title.0 = name.unwrap_or_default();
     for (Meter(i), mut t) in &mut meters {
         let name = ["Здоровье", "Мана", "Выносливость"][*i];

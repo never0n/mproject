@@ -1,3 +1,8 @@
+//! Inventory window ("Снаряжение", key I): hero preview, weapon/armour slots, 30-slot bag pages.
+//! Slot behaviour (icons, drag, tooltips) lives in `actionbar`; this module only builds the
+//! window and pages. It also creates the two off-screen 3D cameras: the HUD portrait and the
+//! model preview (shared with the lobby gallery). Both render only `RenderLayers` layer 1,
+//! where the preview model and its lights live, so the main world never appears in them.
 use crate::{
     Movement,
     actionbar::{self, Icons, ModelDrop, Slot},
@@ -10,21 +15,26 @@ use bevy::{
     render::render_resource::TextureFormat,
     scene::SceneInstanceReady,
 };
+/// Marker for buttons that open the inventory (menu entry).
 #[derive(Component)]
 pub struct OpenInventory;
+/// Current bag page (0-based); real bag index = page × 30 + visible slot.
 #[derive(Resource, Default)]
 pub struct BagPage(pub u16);
 #[derive(Component)]
 pub struct PageButton(i16);
 #[derive(Component)]
 pub struct InventoryOverlay;
+/// Renders the preview model into an image (inventory and lobby). Active only when shown.
 #[derive(Component)]
 pub struct PreviewCamera;
+/// Renders the hero's face for the HUD portrait; always active.
 #[derive(Component)]
 pub struct PortraitCamera;
 #[derive(Component)]
 pub struct Summary;
 
+/// Needs `ui::Portrait`, `lobby::ModelImage` and `Icons` to exist (runs after their setups).
 pub fn setup(
     mut commands: Commands,
     icons: Res<Icons>,
@@ -47,6 +57,7 @@ pub fn setup(
         PortraitCamera,
         Camera3d::default(),
         bevy::core_pipeline::tonemapping::Tonemapping::AcesFitted,
+        // Negative order: render to texture before the main camera (order 0) uses it.
         Camera {
             order: -2,
             clear_color: Color::srgb(0.055, 0.075, 0.092).into(),
@@ -54,6 +65,7 @@ pub fn setup(
         },
         RenderTarget::Image(portrait_target.into()),
         RenderLayers::layer(1),
+        // Initial framing only; `ancestry::frame_preview` re-aims both cameras at the model's head/body.
         Transform::from_xyz(0., 1.70, 0.68).looking_at(Vec3::new(0., 1.70, 0.), Vec3::Y),
     ));
     let target = images.add(Image::new_target_texture(
@@ -88,6 +100,7 @@ pub fn setup(
             Transform::from_rotation(Quat::from_rotation_y(-0.3)),
             RenderLayers::layer(1),
         ))
+        // Render layers are not inherited: tag every mesh of the loaded glTF once it spawns.
         .observe(
             |ready: On<SceneInstanceReady>, children: Query<&Children>, mut commands: Commands| {
                 for e in children.iter_descendants(ready.entity) {
@@ -128,6 +141,7 @@ pub fn setup(
                 ..default()
             },
             BackgroundColor(Color::srgba(0.01, 0.02, 0.03, 0.16)),
+            // Just above the character sheet (10).
             GlobalZIndex(11),
         ))
         .with_children(|root| {
@@ -233,8 +247,14 @@ pub fn setup(
                                 actionbar::slot(p, Slot::Bag(n), &icons, 58.);
                             }
                         });
+                        p.spawn(actionbar::label(
+                            "ПКМ — в открытый сундук или поставить сундук · Shift+ПКМ — на землю · [E] — подобрать/открыть",
+                            &icons.1,
+                            12.,
+                        ));
                     });
                 });
+                // Handled by `crafting::input`, which swaps the bag for the crafting panel.
                 p.spawn((
                     Button,
                     crate::crafting::Action::Open,
@@ -253,6 +273,7 @@ pub fn setup(
             });
         });
 }
+/// I / menu entry toggles the window; PageUp/PageDown or the ←/→ buttons change bag page.
 pub fn input(
     mut state: ResMut<CharacterWindow>,
     keys: Res<ButtonInput<KeyCode>>,
@@ -262,9 +283,6 @@ pub fn input(
     pages: Query<(&PageButton, &Interaction), Changed<Interaction>>,
     toggles: Query<&Interaction, (With<OpenInventory>, Changed<Interaction>)>,
 ) {
-    if state.mail {
-        return;
-    }
     if state.open && state.inventory {
         let direction = if keys.just_pressed(KeyCode::PageDown) {
             1
@@ -276,6 +294,8 @@ pub fn input(
                 .find(|(_, i)| **i == Interaction::Pressed)
                 .map_or(0, |(b, _)| b.0)
         };
+        // Allow one empty page past the last used one. 2183 is the last page whose
+        // 30 slots still fit the protocol's u16 bag index.
         if let Some(c) = network.character.as_ref() {
             let max = mortown_protocol::layout::bag(c)
                 .last_key_value()
@@ -289,9 +309,9 @@ pub fn input(
         return;
     }
     if keys.just_pressed(KeyCode::KeyI) || toggles.iter().any(|i| *i == Interaction::Pressed) {
+        // From another side window, I switches to the inventory instead of closing.
         state.open = !state.open || !state.inventory;
         state.inventory = true;
-        state.trading = false;
         state.skills = false;
         *movement = Movement::default();
         movement.status = "Маршрут остановлен".into();
@@ -309,15 +329,21 @@ pub fn display(
 ) {
     let show = state.open && state.inventory && network.playing() && !crafting.0;
     root.display = if show { Display::Flex } else { Display::None };
+    // Off-screen render costs GPU time, so the preview camera runs only when visible.
     camera.is_active = show || form.model_preview(&network).is_some();
     summary.0 = network
         .character
         .as_ref()
         .map(|c| {
+            use mortown_protocol::items;
             format!(
-                "{}   ·   Занято ячеек: {}   ·   Страница {}",
+                "{}   ·   Груз {:.1} / {:.0} кг   ·   Кошель {} ({} / {} монет)   ·   Страница {}",
                 c.nickname,
-                mortown_protocol::layout::bag(c).len(),
+                items::carried_weight(&c.items),
+                items::CARRY_LIMIT,
+                items::format_coins(items::purse_value(&c.items)),
+                items::coin_count(items::purse_value(&c.items)),
+                items::PURSE_LIMIT,
                 page.0 + 1
             )
         })

@@ -1,9 +1,15 @@
+use crate::inventory::{self, Change};
 use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier, password_hash::SaltString};
 use mortown_protocol::{
-    Actor, Character, starting_stats, validate_character, validate_credentials,
+    Actor, Character,
+    items::{self, Location, Stack},
+    starting_stats,
+    transfer::{self, Holder},
+    validate_character, validate_credentials,
 };
 use rand_core::OsRng;
 use sqlx::{Connection, PgConnection, PgPool, Row};
+use std::collections::BTreeMap;
 
 pub struct Registration {
     pub login: String,
@@ -57,8 +63,6 @@ pub async fn login(pool: &PgPool, login: String, password: String) -> Result<i64
 }
 pub struct CharacterCreation {
     pub nickname: String,
-    pub race: u8,
-    pub class: u8,
     pub gender: u8,
 }
 pub async fn create_character(
@@ -66,7 +70,7 @@ pub async fn create_character(
     account: i64,
     c: CharacterCreation,
 ) -> Result<i64, String> {
-    validate_character(&c.nickname, c.race, c.class, c.gender)?;
+    validate_character(&c.nickname, c.gender)?;
     let mut tx = conn.begin().await.map_err(database_error)?;
     // Serialize allocation even across independent service connections.
     sqlx::query("SELECT id FROM accounts WHERE id=$1 FOR UPDATE")
@@ -76,49 +80,330 @@ pub async fn create_character(
         .map_err(database_error)?;
     let slot: Option<i32>=sqlx::query_scalar("SELECT n FROM generate_series(1,12) n WHERE NOT EXISTS (SELECT 1 FROM characters WHERE account_id=$1 AND slot=n) ORDER BY n LIMIT 1").bind(account).fetch_optional(&mut *tx).await.map_err(database_error)?;
     let slot = slot.ok_or("На аккаунте уже 12 персонажей")?;
-    let id=sqlx::query_scalar("INSERT INTO characters(account_id,slot,nickname,race,class,gender,stats,x,z,inventory) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING id")
-        .bind(account).bind(slot as i16).bind(c.nickname).bind(i16::from(c.race)).bind(i16::from(c.class)).bind(i16::from(c.gender))
-        .bind(serde_json::to_value(starting_stats(c.race,c.class).unwrap()).unwrap()).bind(mortown_world::SPAWN[0]).bind(mortown_world::SPAWN[1]).bind(serde_json::to_value(mortown_protocol::items::starter(c.class)).unwrap())
+    let id=sqlx::query_scalar("INSERT INTO characters(account_id,slot,nickname,gender,stats,x,z) VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING id")
+        .bind(account).bind(slot as i16).bind(c.nickname).bind(i16::from(c.gender))
+        .bind(serde_json::to_value(starting_stats().unwrap()).unwrap()).bind(mortown_world::SPAWN[0]).bind(mortown_world::SPAWN[1])
         .fetch_one(&mut *tx).await.map_err(database_error)?;
+    let mut kit: Vec<Stack> = items::STARTER
+        .iter()
+        .enumerate()
+        .map(|(n, &kind)| Stack::new(kind, 1, Location::Bag { cell: n as u16 }))
+        .collect();
+    transfer::set_coins(
+        &mut kit,
+        Holder::Character,
+        mortown_protocol::starting_coins(),
+    )?;
+    inventory::sync(
+        &mut tx,
+        &[Change {
+            owner: Some(id),
+            before: &[],
+            after: &kit,
+        }],
+    )
+    .await?;
     tx.commit().await.map_err(database_error)?;
     Ok(id)
 }
-pub(crate) fn character(row: &sqlx::postgres::PgRow) -> Result<Character, String> {
-    let mut inventory: Vec<mortown_protocol::items::Item> =
-        serde_json::from_value(row.get("inventory")).map_err(|_| "Ошибка инвентаря")?;
-    let loot: std::collections::BTreeMap<u8, u32> =
-        serde_json::from_value(row.get("loot")).map_err(|_| "Ошибка добычи")?;
-    mortown_protocol::items::include_loot(&mut inventory, &loot);
-    let mut stats: std::collections::BTreeMap<String, f64> =
+/// Applies `legacy::humanize` once to every character archived by migration 0016.
+/// One transaction: a crash leaves either all or none of them converted.
+pub async fn convert_legacy_characters(conn: &mut PgConnection) -> Result<u64, sqlx::Error> {
+    let mut tx = conn.begin().await?;
+    let rows = sqlx::query(
+        "SELECT a.id, a.character_id, a.data FROM legacy_character_archive a \
+         JOIN characters c ON c.id = a.character_id \
+         WHERE a.migration='0016_human_characters' AND a.converted_at IS NULL FOR UPDATE",
+    )
+    .fetch_all(&mut *tx)
+    .await?;
+    for row in &rows {
+        let data: serde_json::Value = row.get("data");
+        let invalid =
+            |e: serde_json::Error| sqlx::Error::Decode(format!("legacy data: {e}").into());
+        let small = |key: &str| data[key].as_u64().unwrap_or(0) as u8;
+        let converted = mortown_protocol::legacy::humanize(
+            small("race"),
+            small("class"),
+            serde_json::from_value(data["stats"].clone()).map_err(invalid)?,
+            serde_json::from_value(data["inventory"].clone()).map_err(invalid)?,
+            serde_json::from_value(data["loot"].clone()).map_err(invalid)?,
+        )
+        .map_err(|e| sqlx::Error::Protocol(e.into()))?;
+        sqlx::query("UPDATE characters SET stats=$2, inventory=$3, loot=$4 WHERE id=$1")
+            .bind(row.get::<i64, _>("character_id"))
+            .bind(serde_json::to_value(converted.stats).unwrap())
+            .bind(serde_json::to_value(converted.inventory).unwrap())
+            .bind(serde_json::to_value(converted.loot).unwrap())
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("UPDATE legacy_character_archive SET converted_at=now() WHERE id=$1")
+            .bind(row.get::<i64, _>("id"))
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await?;
+    Ok(rows.len() as u64)
+}
+/// Archives nothing itself: migration 0019 already stored the pre-conversion stats.
+/// Removes the old skill-point currency, keeps purchased skill flags and items, and grants
+/// talent points from the current level by the new per-level rule. Unspent SP is not turned
+/// into talents or class bonuses; it remains only in the archive row.
+pub async fn convert_legacy_progress(conn: &mut PgConnection) -> Result<u64, String> {
+    let mut tx = conn.begin().await.map_err(database_error)?;
+    let rows = sqlx::query(
+        "SELECT a.id AS archive, c.id, c.stats \
+         FROM legacy_character_archive a JOIN characters c ON c.id = a.character_id \
+         WHERE a.migration='0019_progression' AND a.converted_at IS NULL \
+         ORDER BY c.id FOR UPDATE",
+    )
+    .fetch_all(&mut *tx)
+    .await
+    .map_err(database_error)?;
+    for row in &rows {
+        let id: i64 = row.get("id");
+        let mut stats: BTreeMap<String, f64> = serde_json::from_value(row.get("stats"))
+            .map_err(|_| format!("Не удалось прочитать прогресс персонажа {id}"))?;
+        stats.remove("sp");
+        if !stats.contains_key("talent_point") {
+            let level = stats.get("level").copied().unwrap_or(1.).max(1.) as u32;
+            stats.insert(
+                "talent_point".into(),
+                mortown_protocol::progression::talent_points_for_level(level),
+            );
+        }
+        sqlx::query("UPDATE characters SET stats=$2 WHERE id=$1")
+            .bind(id)
+            .bind(serde_json::to_value(&stats).unwrap())
+            .execute(&mut *tx)
+            .await
+            .map_err(database_error)?;
+        sqlx::query("UPDATE legacy_character_archive SET converted_at=now() WHERE id=$1")
+            .bind(row.get::<i64, _>("archive"))
+            .execute(&mut *tx)
+            .await
+            .map_err(database_error)?;
+    }
+    tx.commit().await.map_err(database_error)?;
+    Ok(rows.len() as u64)
+}
+/// Turns every inventory archived by migration 0018 into physical stacks (`legacy::physical`)
+/// and releases the property recorded by migration 0017 into the world. Runs after
+/// `convert_legacy_characters`, in one transaction. Returns the number of characters converted.
+pub async fn convert_legacy_items(
+    conn: &mut PgConnection,
+    world: &mortown_world::World,
+) -> Result<u64, String> {
+    let mut tx = conn.begin().await.map_err(database_error)?;
+    let rows = sqlx::query(
+        "SELECT a.id AS archive, c.id, c.stats, c.inventory, c.loot \
+         FROM legacy_character_archive a JOIN characters c ON c.id = a.character_id \
+         WHERE a.migration='0018_physical_items' AND a.converted_at IS NULL \
+         ORDER BY c.id FOR UPDATE",
+    )
+    .fetch_all(&mut *tx)
+    .await
+    .map_err(database_error)?;
+    for row in &rows {
+        let id: i64 = row.get("id");
+        let invalid = |_| format!("Не удалось прочитать старый инвентарь персонажа {id}");
+        let stats: BTreeMap<String, f64> =
+            serde_json::from_value(row.get("stats")).map_err(invalid)?;
+        let inventory: Vec<mortown_protocol::legacy::Item> =
+            serde_json::from_value(row.get("inventory")).map_err(invalid)?;
+        let loot: BTreeMap<u8, u32> = serde_json::from_value(row.get("loot")).map_err(invalid)?;
+        let mut physical =
+            mortown_protocol::legacy::physical(stats.clone(), inventory.clone(), &loot);
+        let mut ids = Vec::new();
+        for (token, stack) in &physical.stacks {
+            ids.push((*token, inventory::insert(&mut tx, Some(id), stack).await?));
+        }
+        mortown_protocol::legacy::rebind(&mut physical.stats, &physical.copies, &ids);
+        sqlx::query(
+            "UPDATE characters SET stats=$2, inventory='[]'::jsonb, loot='{}'::jsonb WHERE id=$1",
+        )
+        .bind(id)
+        .bind(serde_json::to_value(&physical.stats).unwrap())
+        .execute(&mut *tx)
+        .await
+        .map_err(database_error)?;
+        sqlx::query("UPDATE legacy_character_archive SET data=$2, converted_at=now() WHERE id=$1")
+            .bind(row.get::<i64, _>("archive"))
+            .bind(serde_json::json!({"stats": stats, "inventory": inventory, "loot": loot}))
+            .execute(&mut *tx)
+            .await
+            .map_err(database_error)?;
+    }
+    release_legacy_property(&mut tx, world).await?;
+    tx.commit().await.map_err(database_error)?;
+    Ok(rows.len() as u64)
+}
+/// Mail attachments and unpaid sale coins go to their owner's bag and purse; each alliance's
+/// old warehouse becomes a locked chest by the guild hall whose only key lies in the leader's bag.
+/// `released_to` records where every record went.
+async fn release_legacy_property(
+    conn: &mut PgConnection,
+    world: &mortown_world::World,
+) -> Result<(), String> {
+    let rows = sqlx::query(
+        "SELECT p.id, p.character_id, p.alliance_id, p.kind, p.quantity, p.coins, a.leader_id \
+         FROM legacy_property p LEFT JOIN alliances a ON a.id = p.alliance_id \
+         WHERE p.released_at IS NULL ORDER BY p.id FOR UPDATE OF p",
+    )
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(database_error)?;
+    let mut chests: BTreeMap<i64, (i64, Vec<Stack>)> = BTreeMap::new();
+    let mut taken = crate::objects::placed(conn).await?;
+    for row in &rows {
+        let record: i64 = row.get("id");
+        let stacks: Vec<Stack> = match (
+            row.get::<Option<i16>, _>("kind"),
+            row.get::<Option<i32>, _>("quantity"),
+        ) {
+            (Some(kind), Some(quantity)) => {
+                let kind = kind as u8;
+                let quantity = quantity as u32;
+                if items::equippable(kind) {
+                    (0..quantity)
+                        .map(|_| Stack::new(kind, 1, Location::Purse))
+                        .collect()
+                } else {
+                    vec![Stack::new(kind, quantity, Location::Purse)]
+                }
+            }
+            _ => {
+                let value = row.get::<Option<i64>, _>("coins").unwrap_or(0);
+                let value = u32::try_from(value).map_err(|_| "Неверная сумма старого платежа")?;
+                vec![Stack::new(items::COPPER, value, Location::Purse)]
+            }
+        };
+        let released_to = if let Some(owner) = row.get::<Option<i64>, _>("character_id") {
+            for s in stacks {
+                give(conn, owner, s).await?;
+            }
+            serde_json::json!({"to": "character", "character": owner})
+        } else {
+            let alliance: i64 = row.get("alliance_id");
+            let leader: i64 = row.get("leader_id");
+            let hall = mortown_world::HALL_SPECS
+                .iter()
+                .find(|h| h.name == "Дом гильдий")
+                .map_or(mortown_world::SPAWN, |h| h.center);
+            let mut placed = None;
+            for s in stacks {
+                loop {
+                    if let std::collections::btree_map::Entry::Vacant(entry) =
+                        chests.entry(alliance)
+                    {
+                        let at = crate::objects::spot(world, hall, 30., &taken);
+                        taken.push(at);
+                        let (container, key) = crate::objects::create_locked(conn, at).await?;
+                        give(conn, leader, key).await?;
+                        entry.insert((container, Vec::new()));
+                    }
+                    let (container, contents) = chests.get_mut(&alliance).unwrap();
+                    let holder = Holder::Container {
+                        id: *container,
+                        cells: mortown_protocol::objects::CHEST_CELLS,
+                    };
+                    if transfer::put(contents, holder, s).is_ok() {
+                        placed = Some(*container);
+                        break;
+                    }
+                    // This chest is full: store it and place another one with its own key.
+                    let (_, contents) = chests.remove(&alliance).unwrap();
+                    store_contents(conn, &contents).await?;
+                }
+            }
+            serde_json::json!({"to": "container", "container": placed, "key_holder": leader, "alliance": alliance})
+        };
+        sqlx::query("UPDATE legacy_property SET released_at=now(), released_to=$2 WHERE id=$1")
+            .bind(record)
+            .bind(released_to)
+            .execute(&mut *conn)
+            .await
+            .map_err(database_error)?;
+    }
+    for (_, contents) in chests.values() {
+        store_contents(conn, contents).await?;
+    }
+    Ok(())
+}
+async fn store_contents(conn: &mut PgConnection, contents: &[Stack]) -> Result<(), String> {
+    inventory::sync(
+        conn,
+        &[Change {
+            owner: None,
+            before: &[],
+            after: contents,
+        }],
+    )
+    .await
+}
+/// Puts one stack into a character's bag or purse, regardless of the carry limit: used only for
+/// property the character already owned before it became physical.
+async fn give(conn: &mut PgConnection, owner: i64, s: Stack) -> Result<(), String> {
+    let before = inventory::carried(conn, owner).await?;
+    let mut after = before.clone();
+    transfer::put(&mut after, Holder::Character, s)?;
+    inventory::sync(
+        conn,
+        &[Change {
+            owner: Some(owner),
+            before: &before,
+            after: &after,
+        }],
+    )
+    .await
+}
+/// The sheet the client sees: stored base stats with level growth and worn-item bonuses.
+pub(crate) async fn character(
+    conn: &mut PgConnection,
+    row: &sqlx::postgres::PgRow,
+) -> Result<Character, String> {
+    let id: i64 = row.get("id");
+    let items = inventory::listed(conn, id).await?;
+    let mut stats: BTreeMap<String, f64> =
         serde_json::from_value(row.get("stats")).map_err(|_| "Ошибка характеристик")?;
     let level = stats.get("level").copied().unwrap_or(1.) as u32;
-    mortown_protocol::progression::grow(&mut stats, level.clamp(1, 100) - 1);
-    for item in inventory.iter().filter(|i| i.equipped) {
-        if let Some(def) = mortown_protocol::items::definition(item.kind) {
-            *stats.entry(def.stat.into()).or_default() += def.bonus;
+    mortown_protocol::progression::grow(&mut stats, level.max(1) - 1);
+    for s in items
+        .iter()
+        .filter(|s| matches!(s.location, Location::Worn { .. }))
+    {
+        if let Some(def) = items::definition(s.kind) {
+            *stats.entry(def.stat.into()).or_default() += items::effective_bonus(s.kind, &stats);
         }
     }
     Ok(Character {
-        id: row.get("id"),
+        id,
         slot: row.get::<i16, _>("slot") as u8,
         nickname: row.get("nickname"),
-        race: row.get::<i16, _>("race") as u8,
-        class: row.get::<i16, _>("class") as u8,
         gender: row.get::<i16, _>("gender") as u8,
         stats,
-        inventory,
-        loot,
+        items,
     })
 }
-pub async fn characters(conn: &mut PgConnection, account: i64) -> Result<Vec<Character>, String> {
-    sqlx::query("SELECT * FROM characters WHERE account_id=$1 ORDER BY slot")
-        .bind(account)
-        .fetch_all(conn)
+pub(crate) async fn sheet(conn: &mut PgConnection, id: i64) -> Result<Character, String> {
+    let row = sqlx::query("SELECT * FROM characters WHERE id=$1")
+        .bind(id)
+        .fetch_one(&mut *conn)
         .await
-        .map_err(database_error)?
-        .iter()
-        .map(character)
-        .collect()
+        .map_err(database_error)?;
+    character(conn, &row).await
+}
+pub async fn characters(conn: &mut PgConnection, account: i64) -> Result<Vec<Character>, String> {
+    let rows = sqlx::query("SELECT * FROM characters WHERE account_id=$1 ORDER BY slot")
+        .bind(account)
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(database_error)?;
+    let mut out = Vec::new();
+    for row in &rows {
+        out.push(character(conn, row).await?);
+    }
+    Ok(out)
 }
 pub async fn load(
     conn: &mut PgConnection,
@@ -128,37 +413,33 @@ pub async fn load(
     let row = sqlx::query("SELECT * FROM characters WHERE account_id=$1 AND id=$2")
         .bind(account)
         .bind(character_id)
-        .fetch_optional(conn)
+        .fetch_optional(&mut *conn)
         .await
         .map_err(database_error)?
         .ok_or("Персонаж не найден на вашем аккаунте")?;
     Ok((
-        character(&row)?,
+        character(conn, &row).await?,
         [row.get("x"), row.get("z")],
         row.get("yaw"),
     ))
 }
 pub(crate) const STALE_ADMIN: &str =
     "Персонаж изменён администратором. Войдите заново для загрузки сохранённого состояния";
-pub(crate) fn check_admin_revision(c: &Character, actor: &Actor) -> Result<(), String> {
-    if c.stats.get("admin_revision").copied().unwrap_or(0.)
-        != f64::from(actor.progress.admin_revision)
-    {
-        Err(STALE_ADMIN.into())
-    } else {
-        Ok(())
-    }
-}
 pub async fn save(conn: &mut PgConnection, actor: &Actor) -> Result<(), String> {
-    let mut updates = std::collections::BTreeMap::new();
+    let mut updates = BTreeMap::new();
     actor.progress.write_stats(&mut updates);
+    actor.orders.write_stats(&mut updates);
+    updates.insert("lives".into(), f64::from(actor.lives));
+    updates.insert("bound".into(), f64::from(u8::from(actor.bound)));
+    updates.insert("return_until".into(), actor.return_until as f64);
+    updates.insert("hunger".into(), actor.hunger);
+    updates.insert("thirst".into(), actor.thirst);
     updates.insert("current_hp".into(), actor.hp);
     updates.insert("current_mana".into(), actor.mana);
     updates.insert("current_stamina".into(), actor.stamina);
-    let changed=sqlx::query("UPDATE characters SET x=$1,z=$2,yaw=$3,saved_at=now(),stats=stats || $5::jsonb,loot=$6 WHERE id=$4 AND coalesce((stats->>'admin_revision')::double precision,0)=$7")
+    let changed=sqlx::query("UPDATE characters SET x=$1,z=$2,yaw=$3,saved_at=now(),stats=stats || $5::jsonb WHERE id=$4 AND coalesce((stats->>'admin_revision')::double precision,0)=$6")
         .bind(actor.position[0]).bind(actor.position[2]).bind(actor.yaw).bind(actor.id)
         .bind(serde_json::to_value(updates).unwrap())
-        .bind(serde_json::to_value(&actor.loot).unwrap())
         .bind(f64::from(actor.progress.admin_revision))
         .execute(conn)
         .await
@@ -168,7 +449,7 @@ pub async fn save(conn: &mut PgConnection, actor: &Actor) -> Result<(), String> 
     }
     Ok(())
 }
-fn database_error(error: sqlx::Error) -> String {
+pub(crate) fn database_error(error: sqlx::Error) -> String {
     if error
         .as_database_error()
         .is_some_and(|e| e.is_unique_violation())
@@ -178,31 +459,6 @@ fn database_error(error: sqlx::Error) -> String {
         eprintln!("Database operation failed: {error}");
         "База данных недоступна. Попробуйте снова".into()
     }
-}
-
-pub async fn set_equipment(
-    conn: &mut PgConnection,
-    id: i64,
-    item: u8,
-    equipped: bool,
-) -> Result<Character, String> {
-    let mut tx = conn.begin().await.map_err(database_error)?;
-    let row = sqlx::query("SELECT * FROM characters WHERE id=$1 FOR UPDATE")
-        .bind(id)
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(database_error)?;
-    let mut c = character(&row)?;
-    mortown_protocol::items::equip(&mut c.inventory, c.class, item, equipped)?;
-    let row = sqlx::query("UPDATE characters SET inventory=$2 WHERE id=$1 RETURNING *")
-        .bind(id)
-        .bind(serde_json::to_value(c.inventory).unwrap())
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(database_error)?;
-    let result = character(&row)?;
-    tx.commit().await.map_err(database_error)?;
-    Ok(result)
 }
 
 pub enum ExchangeFailure {
@@ -224,269 +480,146 @@ pub async fn exchange(
     conn: &mut PgConnection,
     actor: Actor,
     action: crate::economy::Action,
-    world: &mortown_world::World,
 ) -> Result<(Character, Actor), ExchangeFailure> {
-    exchange_at(conn, actor, action, world, None).await
-}
-pub async fn exchange_at(
-    conn: &mut PgConnection,
-    mut actor: Actor,
-    action: crate::economy::Action,
-    world: &mortown_world::World,
-    resident: Option<mortown_world::npcs::Npc>,
-) -> Result<(Character, Actor), ExchangeFailure> {
-    let mut tx = conn.begin().await.map_err(database_error)?;
-    let row = sqlx::query("SELECT * FROM characters WHERE id=$1 FOR UPDATE")
-        .bind(actor.id)
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(database_error)?;
-    let mut c = character(&row)?;
-    check_admin_revision(&c, &actor)?;
-    match action {
-        crate::economy::Action::Specialize {
-            profession,
-            expected,
-        } => {
-            if actor.hp <= 0. {
-                return Err("Сначала возродитесь".into());
+    use crate::economy::Action;
+    inventory::transaction(conn, async |tx| {
+        let mut actor = actor;
+        let mut c = inventory::load(&mut *tx, &actor).await?;
+        let before = c.items.clone();
+        match action {
+            Action::Craft { recipe, expected } => {
+                let count = mortown_protocol::crafting::count(&c);
+                if count != expected {
+                    return Err("Ремесло уже обновлено: повторная команда отклонена".into());
+                }
+                let next = count.checked_add(1).ok_or("Достигнут предел ремесла")?;
+                crate::economy::craft(&mut actor, &mut c, recipe)?;
+                let xp = mortown_protocol::progression::craft_experience();
+                let levels = actor.progress.add_experience(xp);
+                actor.progress.write_stats(&mut c.stats);
+                c.stats
+                    .insert(mortown_protocol::crafting::COUNTER.into(), f64::from(next));
+                if levels > 0 {
+                    let mut derived = c.stats.clone();
+                    mortown_protocol::progression::grow(&mut derived, actor.progress.level - 1);
+                    actor.hp =
+                        (actor.hp + (derived["hp"] - actor.max_hp).max(0.)).min(derived["hp"]);
+                    actor.max_hp = derived["hp"];
+                }
+                actor.reward_status = format!("{} · +{xp} опыта", actor.reward_status);
             }
-            let mut base =
-                serde_json::from_value(row.get("stats")).map_err(|_| "Ошибка характеристик")?;
-            let cost = mortown_protocol::professions::choose(
-                &mut base,
-                profession,
+            Action::Arrange {
+                source,
+                target,
                 expected,
-                actor.progress.coins,
-            )?;
-            actor.progress.coins -= f64::from(cost);
-            actor.reward_status = format!(
-                "Специализация: {}{}",
-                profession.name(),
-                if cost == 0 {
-                    " · бесплатно".into()
-                } else {
-                    format!(" · −{cost} монет")
+            } => {
+                mortown_protocol::layout::arrange(&mut c, source, target, expected)?;
+                actor.reward_status = "Расположение сохранено".into();
+            }
+            // Hotbar shortcuts: 1–2 base skills, 100 + kind for a supply kind.
+            Action::BindHotbar { slot, binding } => {
+                let token = match binding {
+                    0..=2 => u64::from(binding),
+                    101..=255
+                        if items::stackable(binding - 100)
+                            && items::coin_value(binding - 100).is_none() =>
+                    {
+                        mortown_protocol::layout::kind_token(binding - 100)
+                    }
+                    _ => return Err("Недопустимый слот или действие".into()),
+                };
+                if slot >= mortown_protocol::layout::HOTBAR {
+                    return Err("Недопустимый слот или действие".into());
                 }
-            );
-            sqlx::query("UPDATE characters SET stats=$2 WHERE id=$1")
-                .bind(actor.id)
-                .bind(serde_json::to_value(&base).unwrap())
-                .execute(&mut *tx)
-                .await
-                .map_err(database_error)?;
+                c.stats.insert(format!("hotbar_{slot}"), token as f64);
+                actor.reward_status = format!("Панель F{} сохранена", slot + 1);
+            }
+            Action::SpendAttribute { stat, expected } => {
+                if actor.hp <= 0. {
+                    return Err("Сначала возродитесь".into());
+                }
+                if actor.progress.stat_points < 1. {
+                    return Err("Нет свободных очков характеристик".into());
+                }
+                let mut old = c.stats.clone();
+                mortown_protocol::progression::grow(&mut old, actor.progress.level - 1);
+                mortown_protocol::attributes::increase(&mut c.stats, &stat, expected)?;
+                let mut derived = c.stats.clone();
+                mortown_protocol::progression::grow(&mut derived, actor.progress.level - 1);
+                actor.hp = (actor.hp + (derived["hp"] - actor.max_hp).max(0.)).min(derived["hp"]);
+                actor.mana =
+                    (actor.mana + (derived["mana"] - old["mana"]).max(0.)).min(derived["mana"]);
+                actor.stamina = (actor.stamina + (derived["stamina"] - old["stamina"]).max(0.))
+                    .min(derived["stamina"]);
+                actor.max_hp = derived["hp"];
+                actor.progress.stat_points -= 1.;
+                actor.reward_status = format!(
+                    "{} +1 · потрачено 1 очко",
+                    mortown_protocol::attributes::ATTRIBUTES
+                        .iter()
+                        .find(|(key, _)| *key == stat)
+                        .unwrap()
+                        .1
+                );
+            }
+            Action::SpendTalent { talent, expected } => {
+                crate::economy::spend_talent(&mut actor, &mut c, &talent, expected)?
+            }
+            Action::Potion => crate::economy::potion(&mut actor, &mut c)?,
         }
-        crate::economy::Action::Craft {
-            recipe,
-            expected,
-            specialization_revision,
-        } => {
-            if mortown_protocol::professions::revision(&c.stats) != specialization_revision {
-                return Err("Специализация изменилась. Посмотрите новый расход материалов и повторите изготовление".into());
+        inventory::sync(
+            &mut *tx,
+            &[Change {
+                owner: Some(actor.id),
+                before: &before,
+                after: &c.items,
+            }],
+        )
+        .await?;
+        let c = inventory::finish(&mut *tx, &mut actor, &c, "").await?;
+        Ok((c, actor))
+    })
+    .await
+}
+/// Puts the first bag copy of `kind` on (or takes the worn one off into a free cell).
+pub async fn set_equipment(
+    conn: &mut PgConnection,
+    actor: Actor,
+    kind: u8,
+    equipped: bool,
+) -> Result<(Character, Actor), ExchangeFailure> {
+    use mortown_protocol::layout::{Place, at, equipped as worn};
+    let slot = items::slot(kind).ok_or("Этот предмет нельзя надеть")?;
+    let weapon = slot == items::Slot::Weapon;
+    let probe =
+        inventory::transaction(conn, async |tx| Ok(inventory::load(tx, &actor).await?)).await?;
+    let action = if equipped {
+        let cell = probe.items.iter().find_map(|s| match s.location {
+            Location::Bag { cell } if s.kind == kind => Some(cell),
+            _ => None,
+        });
+        match cell {
+            Some(cell) => crate::economy::Action::Arrange {
+                source: Place::Bag(cell),
+                target: Place::Equipment(weapon),
+                expected: at(&probe, Place::Bag(cell)),
+            },
+            None if items::worn(&probe.items, slot).is_some_and(|s| s.kind == kind) => {
+                return Ok((sheet(conn, actor.id).await?, actor));
             }
-            let count = mortown_protocol::crafting::count(&c);
-            if count != expected {
-                return Err("Ремесло уже обновлено: повторная команда отклонена".into());
-            }
-            let next = count.checked_add(1).ok_or("Достигнут предел ремесла")?;
-            let mut bag = c.clone();
-            bag.stats =
-                serde_json::from_value(row.get("stats")).map_err(|_| "Ошибка характеристик")?;
-            actor.progress.write_stats(&mut bag.stats);
-            bag.loot = actor.loot.clone();
-            mortown_protocol::items::include_loot(&mut bag.inventory, &bag.loot);
-            crate::economy::craft(&mut actor, recipe, &bag.stats)?;
-            let recipe =
-                mortown_protocol::crafting::definition(recipe).ok_or("Неизвестный рецепт")?;
-            // Consume exact bag stacks so depleted material shortcuts cannot reappear later.
-            for (kind, quantity) in recipe.requirements(&bag.stats) {
-                mortown_protocol::transfer::take(
-                    &mut bag,
-                    &mortown_protocol::mail::AttachmentRequest {
-                        token: mortown_protocol::layout::token(kind, 0),
-                        quantity,
-                        price: 0,
-                    },
-                )?;
-            }
-            mortown_protocol::transfer::give(&mut bag, recipe.result, 1)?;
-            let gain = recipe.profession.gain(&mut bag.stats);
-            if gain.experience > 0 {
-                actor.reward_status.push_str(&format!(
-                    " · {}: +{} опыта",
-                    recipe.profession.name(),
-                    gain.experience
-                ));
-            }
-            if gain.after > gain.before {
-                actor
-                    .reward_status
-                    .push_str(&format!(" · уровень ремесла {}!", gain.after));
-            }
-            bag.stats
-                .insert(mortown_protocol::crafting::COUNTER.into(), f64::from(next));
-            sqlx::query("UPDATE characters SET stats=$2 WHERE id=$1")
-                .bind(actor.id)
-                .bind(serde_json::to_value(&bag.stats).unwrap())
-                .execute(&mut *tx)
-                .await
-                .map_err(database_error)?;
-            c.inventory = bag.inventory;
+            None => return Err("У персонажа нет этого предмета".into()),
         }
+    } else {
+        let current = worn(&probe, weapon);
+        if current == 0 || items::worn(&probe.items, slot).map(|s| s.kind) != Some(kind) {
+            return Ok((sheet(conn, actor.id).await?, actor));
+        }
+        let free = mortown_protocol::layout::free_cell(&probe.items).ok_or("Рюкзак переполнен")?;
         crate::economy::Action::Arrange {
-            source,
-            target,
-            expected,
-        } => {
-            let mut base = c.clone();
-            base.stats =
-                serde_json::from_value(row.get("stats")).map_err(|_| "Ошибка характеристик")?;
-            actor.progress.write_stats(&mut base.stats);
-            base.loot = actor.loot.clone();
-            mortown_protocol::items::include_loot(&mut base.inventory, &base.loot);
-            mortown_protocol::layout::arrange(&mut base, source, target, expected)?;
-            sqlx::query("UPDATE characters SET stats=$2 WHERE id=$1")
-                .bind(actor.id)
-                .bind(serde_json::to_value(&base.stats).unwrap())
-                .execute(&mut *tx)
-                .await
-                .map_err(database_error)?;
-            c.inventory = base.inventory;
-            actor.reward_status = "Расположение сохранено".into();
+            source: Place::Equipment(weapon),
+            target: Place::Bag(free),
+            expected: current,
         }
-        crate::economy::Action::BindHotbar { slot, binding } => {
-            if slot >= 12 || !matches!(binding, 0..=2 | 101..=108) {
-                return Err("Недопустимый слот или действие".into());
-            }
-            sqlx::query("UPDATE characters SET stats=jsonb_set(stats, ARRAY[$2], to_jsonb($3::int)) WHERE id=$1")
-                .bind(actor.id).bind(format!("hotbar_{slot}")).bind(i32::from(binding))
-                .execute(&mut *tx).await.map_err(database_error)?;
-            actor.reward_status = format!("Панель F{} сохранена", slot + 1);
-        }
-        crate::economy::Action::SpendAttribute { stat, expected } => {
-            if actor.hp <= 0. {
-                return Err("Сначала возродитесь".into());
-            }
-            if actor.progress.stat_points < 1. {
-                return Err("Нет свободных очков характеристик".into());
-            }
-            let mut base: std::collections::BTreeMap<String, f64> =
-                serde_json::from_value(row.get("stats")).map_err(|_| "Ошибка характеристик")?;
-            let old_level = c.stats["level"] as u32;
-            mortown_protocol::progression::grow(
-                &mut c.stats,
-                actor.progress.level.saturating_sub(old_level),
-            );
-            actor.progress.write_stats(&mut base);
-            mortown_protocol::attributes::increase(&mut base, c.race, c.class, &stat, expected)?;
-            let mut derived = base.clone();
-            mortown_protocol::progression::grow(&mut derived, actor.progress.level - 1);
-            actor.hp = (actor.hp + (derived["hp"] - actor.max_hp).max(0.)).min(derived["hp"]);
-            actor.mana =
-                (actor.mana + (derived["mana"] - c.stats["mana"]).max(0.)).min(derived["mana"]);
-            actor.stamina = (actor.stamina + (derived["stamina"] - c.stats["stamina"]).max(0.))
-                .min(derived["stamina"]);
-            actor.max_hp = derived["hp"];
-            actor.progress.stat_points -= 1.;
-            actor.reward_status = format!(
-                "{} +1 · потрачено 1 очко",
-                mortown_protocol::attributes::ATTRIBUTES
-                    .iter()
-                    .find(|(key, _)| *key == stat)
-                    .unwrap()
-                    .1
-            );
-            sqlx::query("UPDATE characters SET stats=$2 WHERE id=$1")
-                .bind(actor.id)
-                .bind(serde_json::to_value(base).unwrap())
-                .execute(&mut *tx)
-                .await
-                .map_err(database_error)?;
-        }
-        crate::economy::Action::LearnSecondary => crate::economy::learn_secondary(&mut actor)?,
-        crate::economy::Action::LearnAbility { skill } => {
-            crate::economy::learn_ability(&mut actor, c.class, c.race, skill)?
-        }
-        crate::economy::Action::LearnSkill { rank } => crate::economy::learn(&mut actor, rank)?,
-        crate::economy::Action::Quest { quest, complete } => {
-            // Delivery also changes bag cells and shortcuts. Persist these with the reward.
-            c.stats =
-                serde_json::from_value(row.get("stats")).map_err(|_| "Ошибка характеристик")?;
-            crate::economy::quest(&mut actor, &mut c, quest, complete, world)?;
-            sqlx::query("UPDATE characters SET stats=$2 WHERE id=$1")
-                .bind(actor.id)
-                .bind(serde_json::to_value(&c.stats).unwrap())
-                .execute(&mut *tx)
-                .await
-                .map_err(database_error)?;
-        }
-        crate::economy::Action::Potion => {
-            crate::economy::apply(&mut actor, &c.inventory, None, world)?
-        }
-        crate::economy::Action::Trade {
-            npc,
-            item,
-            buy,
-            sale,
-        } => {
-            let mut bag = c.clone();
-            bag.stats =
-                serde_json::from_value(row.get("stats")).map_err(|_| "Ошибка характеристик")?;
-            actor.progress.write_stats(&mut bag.stats);
-            bag.loot = actor.loot.clone();
-            mortown_protocol::items::include_loot(&mut bag.inventory, &bag.loot);
-            if buy {
-                if sale.is_some() {
-                    return Err("Покупка не должна содержать вещь из рюкзака".into());
-                }
-                // Materialize automatic cells before the new kind joins the sorted inventory.
-                let cells = mortown_protocol::layout::bag(&bag);
-                bag.stats.retain(|key, _| !key.starts_with("bag_"));
-                for (slot, token) in cells {
-                    bag.stats.insert(format!("bag_{slot}"), token as f64);
-                }
-                mortown_protocol::transfer::give(&mut bag, item, 1)?;
-            } else {
-                let sale = sale.ok_or("Сначала выберите вещь в рюкзаке")?;
-                sale.validate(&bag, item)?;
-                mortown_protocol::transfer::take(
-                    &mut bag,
-                    &mortown_protocol::mail::AttachmentRequest {
-                        token: sale.token,
-                        quantity: 1,
-                        price: 0,
-                    },
-                )?;
-            }
-            // The existing rules determine price and proximity; the bag copy changes atomically.
-            crate::economy::apply_at(
-                &mut actor,
-                &c.inventory,
-                Some((npc, item, buy)),
-                world,
-                resident,
-            )?;
-            actor.loot = bag.loot.clone();
-            c = bag;
-            sqlx::query("UPDATE characters SET stats=$2 WHERE id=$1")
-                .bind(actor.id)
-                .bind(serde_json::to_value(&c.stats).unwrap())
-                .execute(&mut *tx)
-                .await
-                .map_err(database_error)?;
-        }
-    }
-    mortown_protocol::items::include_loot(&mut c.inventory, &actor.loot);
-    save(&mut tx, &actor).await?;
-    let row = sqlx::query("UPDATE characters SET inventory=$2 WHERE id=$1 RETURNING *")
-        .bind(actor.id)
-        .bind(serde_json::to_value(&c.inventory).unwrap())
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(database_error)?;
-    let c = character(&row)?;
-    // A lost COMMIT acknowledgement cannot safely be followed by saving the old actor.
-    tx.commit().await.map_err(|_| ExchangeFailure::Uncertain)?;
-    actor.equipment = mortown_protocol::items::EquipmentAppearance::from_inventory(&c.inventory);
-    Ok((c, actor))
+    };
+    exchange(conn, actor, action).await
 }

@@ -1,17 +1,24 @@
+//! Humanoid model and locomotion animation (idle / walk / run) for every character-like actor:
+//! hero, other players, enemies. Speed is measured from how far the entity moved this frame,
+//! so animation follows whatever moves the `Transform` (`move_player`, `network::receive`, enemy sync).
+//! Attack/skill poses are layered on top by `player_motion.rs` in PostUpdate.
 use bevy::prelude::*;
 use std::time::Duration;
 
 const MODEL: &str = "characters/adventurer.glb";
+/// Shared animation graph; `clips[0/1/2]` = idle / walk / run.
 #[derive(Resource)]
 pub struct HeroAnimations {
     graph: Handle<AnimationGraph>,
     clips: Vec<AnimationNodeIndex>,
 }
+/// Loads the model scene and builds `HeroAnimations` (called from `scene::setup`).
 pub fn load(
     commands: &mut Commands,
     assets: &AssetServer,
     graphs: &mut Assets<AnimationGraph>,
 ) -> Handle<Scene> {
+    // glTF animation indices reordered so the graph is idle, walk, run (see `animate`).
     let (graph, clips) = AnimationGraph::from_clips(
         [0, 2, 1]
             .into_iter()
@@ -23,6 +30,8 @@ pub fn load(
     });
     assets.load(GltfAssetLabel::Scene(0).from_asset(MODEL))
 }
+/// Hooks each newly loaded glTF `AnimationPlayer` to the shared graph and starts idle.
+/// Runs every frame but only touches players added since the last run (`Added`).
 pub fn initialize(
     mut commands: Commands,
     animations: Res<HeroAnimations>,
@@ -38,6 +47,8 @@ pub fn initialize(
             .insert((AnimationGraphHandle(animations.graph.clone()), transitions));
     }
 }
+/// Put on the root entity of anything that should play idle/walk/run; the glTF scene is a child.
+/// `previous` is last frame's position, used to measure speed.
 #[derive(Component, Default)]
 pub struct AnimatedActor {
     previous: Option<Vec3>,
@@ -49,8 +60,10 @@ pub struct Gait {
     pub walk_speed: f32,
     pub run_speed: f32,
 }
+/// `true` freezes the animation (e.g. a fallen enemy); speed isn't measured while held.
 #[derive(Component, Default)]
 pub struct AnimationHold(pub bool);
+/// Chooses idle/walk/run from measured speed and cross-fades to it (160 ms).
 pub fn animate(
     mut actors: Query<(
         &Transform,
@@ -70,6 +83,7 @@ pub fn animate(
         });
         actor.previous = Some(transform.translation);
         actor.held = hold.is_some_and(|h| h.0);
+        // m/s thresholds: below 0.1 idle; below 7 (between WALK_SPEED 5 and RUN_SPEED 10) walk.
         let next = if speed < 0.1 {
             0
         } else if speed < gait.map_or(7., |g| g.walk_speed * 1.5) {
@@ -77,6 +91,7 @@ pub fn animate(
         } else {
             2
         };
+        // The AnimationPlayer sits somewhere inside the loaded glTF hierarchy; search all descendants.
         for root in descendants.iter() {
             for entity in std::iter::once(root).chain(children.iter_descendants(root)) {
                 if let Ok((mut player, mut transitions)) = players.get_mut(entity) {
@@ -96,6 +111,7 @@ pub fn animate(
                             )
                             .repeat();
                     }
+                    // Scale playback to actual speed so feet don't slide (clamped 0.5–1.6×).
                     if let Some(gait) = gait
                         && let Some(active) = player.animation_mut(animations.clips[next])
                     {

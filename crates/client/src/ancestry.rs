@@ -1,13 +1,12 @@
-//! Visual race/gender profiles for the current adventurer rig. No gameplay dimensions change.
+//! Visual gender profiles of the human adventurer rig. No gameplay dimensions change.
 use crate::{
     appearance::{EquipmentRig, Wearer},
     lobby::Form,
     network::Network,
 };
 use bevy::{
-    asset::RenderAssetUsages,
-    camera::visibility::{NoFrustumCulling, RenderLayers},
-    mesh::{Indices, PrimitiveTopology, VertexAttributeValues},
+    camera::visibility::NoFrustumCulling,
+    mesh::{Indices, VertexAttributeValues},
     prelude::*,
 };
 use mortown_protocol::BodyAppearance;
@@ -19,25 +18,15 @@ struct Profile {
     depth: f32,
     chest: f32,
     head: Vec3,
-    tint: Color,
 }
 fn profile(look: BodyAppearance) -> Profile {
-    let (height, width, depth, head, tint) = match look.race {
-        2 => (1.055, 0.88, 0.92, 0.94, Color::srgb(1., 0.92, 0.77)),
-        3 => (1.01, 0.91, 0.93, 0.95, Color::srgb(0.85, 0.94, 0.79)),
-        4 => (1.095, 1.14, 1.13, 1.02, Color::srgb(0.62, 0.83, 0.49)),
-        5 => (0.775, 1.43, 1.25, 1.22, Color::srgb(1., 0.94, 0.88)),
-        6 => (1.04, 1.02, 0.95, 1.0, Color::srgb(0.79, 0.74, 0.94)),
-        _ => (1., 1., 1., 1., Color::WHITE),
-    };
     let female = look.gender == 2;
     Profile {
-        height: height * if female { 0.95 } else { 1. },
-        width: width * if female { 0.94 } else { 1. },
-        depth: depth * if female { 0.95 } else { 1. },
+        height: if female { 0.95 } else { 1. },
+        width: if female { 0.94 } else { 1. },
+        depth: if female { 0.95 } else { 1. },
         chest: if female { 0.94 } else { 1. },
-        head: Vec3::new(head * if female { 0.96 } else { 1. }, head, head),
-        tint,
+        head: Vec3::new(if female { 0.96 } else { 1. }, 1., 1.),
     }
 }
 #[derive(Component)]
@@ -47,8 +36,6 @@ pub struct BodyRig {
     hair: Entity,
     bones: Vec<(Entity, Vec3, Bone)>,
     applied: Option<BodyAppearance>,
-    ornaments: Option<Entity>,
-    layer: RenderLayers,
 }
 #[derive(Clone, Copy)]
 enum Bone {
@@ -59,116 +46,23 @@ enum Bone {
 /// Absolute rest scale avoids accumulating proportions between animation frames.
 #[derive(Component)]
 pub struct BodyScale(Vec3);
-#[derive(Clone)]
-struct Feature {
-    mesh: Handle<Mesh>,
-    material: Handle<StandardMaterial>,
-    transform: Transform,
-}
 struct BodyMeshes {
     clothed: Handle<Mesh>,
     face: Handle<Mesh>,
     hair: Handle<Mesh>,
-    faces: Vec<[Handle<StandardMaterial>; 2]>,
+    faces: [Handle<StandardMaterial>; 2],
     hair_material: Handle<StandardMaterial>,
 }
 #[derive(Resource)]
 pub struct BodyAssets {
     female_texture: Handle<Image>,
     meshes: Option<BodyMeshes>,
-    features: Vec<Vec<Feature>>,
 }
-pub fn setup(
-    mut commands: Commands,
-    assets: Res<AssetServer>,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
-) {
-    let ivory = materials.add(StandardMaterial {
-        base_color: Color::srgb(0.82, 0.75, 0.57),
-        perceptual_roughness: 0.64,
-        ..default()
-    });
-    let mut features = Vec::new();
-    for race in 1..=6 {
-        let mut parts = Vec::new();
-        if matches!(race, 2 | 3) {
-            let tint = profile(BodyAppearance { race, gender: 1 }).tint.to_srgba();
-            let skin = materials.add(StandardMaterial {
-                base_color: Color::srgb(0.69 * tint.red, 0.49 * tint.green, 0.36 * tint.blue),
-                perceptual_roughness: 0.85,
-                cull_mode: None,
-                ..default()
-            });
-            for sign in [-1., 1.] {
-                parts.push(Feature {
-                    mesh: meshes.add(ear(sign, race == 2)),
-                    material: skin.clone(),
-                    transform: Transform::default(),
-                });
-            }
-        }
-        if race == 4 {
-            for sign in [-1., 1.] {
-                parts.push(Feature {
-                    mesh: meshes.add(Cone::new(0.012, 0.046).mesh().resolution(10).build()),
-                    material: ivory.clone(),
-                    transform: Transform::from_xyz(sign * 0.039, 0.036, 0.145)
-                        .with_rotation(Quat::from_rotation_z(-sign * 0.18)),
-                });
-            }
-        }
-        if race == 6 {
-            for (x, length) in [(-0.062, 0.040), (-0.092, 0.025)] {
-                parts.push(Feature {
-                    mesh: meshes.add(Cone::new(0.014, length).mesh().resolution(8).build()),
-                    material: ivory.clone(),
-                    transform: Transform::from_xyz(x, 0.17, 0.08)
-                        .with_rotation(Quat::from_rotation_z(0.34)),
-                });
-            }
-        }
-        features.push(parts);
-    }
+pub fn setup(mut commands: Commands, assets: Res<AssetServer>) {
     commands.insert_resource(BodyAssets {
         female_texture: assets.load("characters/adventurer-female-v1.png"),
         meshes: None,
-        features,
     });
-}
-fn ear(sign: f32, golden: bool) -> Mesh {
-    let tip = if golden {
-        [0.195, 0.185, 0.01]
-    } else {
-        [0.181, 0.143, -0.004]
-    };
-    let points = [
-        [0.087, 0.097, 0.025],
-        [0.097, 0.043, 0.018],
-        tip,
-        [0.119, 0.091, 0.043],
-        [0.117, 0.090, -0.002],
-    ];
-    let mut positions = Vec::<[f32; 3]>::new();
-    for triangle in [
-        [0, 1, 3],
-        [1, 2, 3],
-        [2, 0, 3],
-        [1, 0, 4],
-        [2, 1, 4],
-        [0, 2, 4],
-    ] {
-        for i in triangle {
-            let [x, y, z] = points[i];
-            positions.push([x * sign, y, z]);
-        }
-    }
-    Mesh::new(
-        PrimitiveTopology::TriangleList,
-        RenderAssetUsages::default(),
-    )
-    .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, positions)
-    .with_computed_flat_normals()
 }
 fn split_body(source: &Mesh) -> Option<(Mesh, Mesh, Mesh)> {
     let VertexAttributeValues::Uint16x4(joints) = source.attribute(Mesh::ATTRIBUTE_JOINT_INDEX)?
@@ -276,26 +170,18 @@ pub fn prepare(
             let Some(original) = materials.get(&material.0).cloned() else {
                 continue;
             };
-            let faces = (1..=6)
-                .map(|race| {
-                    std::array::from_fn(|gender| {
-                        let mut material = original.clone();
-                        material.base_color = profile(BodyAppearance {
-                            race,
-                            gender: gender as u8 + 1,
-                        })
-                        .tint;
-                        material.metallic = 0.;
-                        material.perceptual_roughness = 0.86;
-                        if gender == 1 {
-                            material.base_color_texture = Some(assets.female_texture.clone());
-                            // The original normal map contains beard relief as well as skin detail.
-                            material.normal_map_texture = None;
-                        }
-                        materials.add(material)
-                    })
-                })
-                .collect();
+            let faces = std::array::from_fn(|gender| {
+                let mut material = original.clone();
+                material.base_color = Color::WHITE;
+                material.metallic = 0.;
+                material.perceptual_roughness = 0.86;
+                if gender == 1 {
+                    material.base_color_texture = Some(assets.female_texture.clone());
+                    // The original normal map contains beard relief as well as skin detail.
+                    material.normal_map_texture = None;
+                }
+                materials.add(material)
+            });
             assets.meshes = Some(BodyMeshes {
                 clothed: meshes.add(clothed),
                 face: meshes.add(face),
@@ -317,7 +203,7 @@ pub fn prepare(
             .spawn((
                 Name::new("Character face"),
                 Mesh3d(model.face.clone()),
-                MeshMaterial3d(model.faces[0][0].clone()),
+                MeshMaterial3d(model.faces[0].clone()),
                 Transform::default(),
                 gear.skin.clone(),
                 NoFrustumCulling,
@@ -344,8 +230,6 @@ pub fn prepare(
             hair,
             bones,
             applied: None,
-            ornaments: None,
-            layer: gear.layer.clone(),
         });
     }
 }
@@ -356,11 +240,7 @@ fn desired(wearer: &Wearer, network: &Network, form: &Form) -> BodyAppearance {
             .map(|p| p.0)
             .or_else(|| network.character.as_ref().map(BodyAppearance::from)),
         Wearer::Local => network.character.as_ref().map(BodyAppearance::from),
-        Wearer::Enemy(_) => Some(BodyAppearance { race: 1, gender: 1 }),
-        Wearer::Npc(id) => mortown_world::npcs::definition(*id).map(|npc| BodyAppearance {
-            race: npc.race,
-            gender: npc.gender,
-        }),
+        Wearer::Enemy(_) => Some(BodyAppearance { gender: 1 }),
         Wearer::Remote(id) => network
             .roster
             .iter()
@@ -369,11 +249,6 @@ fn desired(wearer: &Wearer, network: &Network, form: &Form) -> BodyAppearance {
     }
     .unwrap_or_default();
     BodyAppearance {
-        race: if (1..=6).contains(&selected.race) {
-            selected.race
-        } else {
-            1
-        },
         gender: if selected.gender == 2 { 2 } else { 1 },
     }
 }
@@ -403,37 +278,13 @@ pub fn display(
             commands.entity(entity).insert(BodyScale(rest * scale));
         }
         commands.entity(rig.face).insert(MeshMaterial3d(
-            meshes.faces[look.race as usize - 1][look.gender as usize - 1].clone(),
+            meshes.faces[look.gender as usize - 1].clone(),
         ));
         commands.entity(rig.hair).insert(if look.gender == 2 {
             Visibility::Inherited
         } else {
             Visibility::Hidden
         });
-        if let Some(entity) = rig.ornaments.take() {
-            commands.entity(entity).despawn();
-        }
-        let features = &assets.features[look.race as usize - 1];
-        if !features.is_empty() {
-            let feature_root = commands
-                .spawn((
-                    Name::new("Ancestry features"),
-                    Transform::default(),
-                    Visibility::Inherited,
-                    ChildOf(rig.head),
-                ))
-                .id();
-            for part in features {
-                commands.spawn((
-                    Mesh3d(part.mesh.clone()),
-                    MeshMaterial3d(part.material.clone()),
-                    part.transform,
-                    rig.layer.clone(),
-                    ChildOf(feature_root),
-                ));
-            }
-            rig.ornaments = Some(feature_root);
-        }
         rig.applied = Some(look);
     }
 }

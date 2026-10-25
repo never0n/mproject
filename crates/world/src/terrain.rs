@@ -1,8 +1,12 @@
 //! One triangulated surface for drawing, walking and terrain picking.
+//! `ground_height` returns exactly the height of the rendered mesh triangles, so feet never float
+//! or sink. Building `Plot`s flatten the ground under houses and halls.
 use crate::{World, height, local, smooth};
 
+/// Render tile size and half-extent of the rendered terrain (m); the mesh extends past `WORLD_HALF`.
 pub const TILE_SIZE: f32 = 512.;
 pub const RENDER_HALF: f32 = 9216.;
+/// Mesh vertex spacing (m): 2 m near the city (±512), 4 m up to ±1024, 16 m beyond.
 pub fn grid_step(x: f32, z: f32) -> f32 {
     if (-512. ..512.).contains(&x) && (-512. ..512.).contains(&z) {
         2.
@@ -13,6 +17,7 @@ pub fn grid_step(x: f32, z: f32) -> f32 {
     }
 }
 
+/// Flat building platform at `level`, blending back to natural terrain over `blend` meters.
 #[derive(Clone, Copy, Debug)]
 pub struct Plot {
     pub center: [f32; 2],
@@ -30,6 +35,7 @@ impl Plot {
     }
 }
 impl World {
+    /// Terrain with all plots applied (plots only exist within ±600 m of the center).
     fn grade_height(&self, x: f32, z: f32) -> f32 {
         let original = height(x, z);
         let mut weighted = original;
@@ -70,6 +76,8 @@ impl World {
         }
         self.grade_height(x, z)
     }
+    /// Height on the rendered mesh: each grid square is split into two triangles and the
+    /// point is interpolated inside its triangle (barycentric weights u, v).
     pub fn ground_height(&self, x: f32, z: f32) -> f32 {
         let step = grid_step(x, z);
         let x0 = (x / step).floor() * step;

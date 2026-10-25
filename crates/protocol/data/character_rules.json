@@ -9,8 +9,9 @@
     "energy": 100,
     "coins": 500,
     "gold": 0,
-    "sp": 0,
-    "statPoint": 0,
+    "statPoint": 5,
+    "talentPoint": 0,
+    "lives": 10,
     "f_attack": 20,
     "f_defence": 20,
     "f_crit_power": 1.5,
@@ -30,115 +31,14 @@
     "location": 1,
     "sublocation": 1
   },
-  "baseStats": {
-    "1_1": {
-      "STR": 14,
-      "DEX": 13,
-      "CON": 12,
-      "INT": 8,
-      "WIT": 6,
-      "MEN": 8,
-      "LUC": 12
-    },
-    "1_2": {
-      "STR": 8,
-      "DEX": 8,
-      "CON": 7,
-      "INT": 14,
-      "WIT": 13,
-      "MEN": 12,
-      "LUC": 11
-    },
-    "2_1": {
-      "STR": 12,
-      "DEX": 15,
-      "CON": 13,
-      "INT": 7,
-      "WIT": 8,
-      "MEN": 7,
-      "LUC": 11
-    },
-    "2_2": {
-      "STR": 7,
-      "DEX": 10,
-      "CON": 6,
-      "INT": 13,
-      "WIT": 15,
-      "MEN": 12,
-      "LUC": 11
-    },
-    "3_1": {
-      "STR": 15,
-      "DEX": 12,
-      "CON": 11,
-      "INT": 7,
-      "WIT": 8,
-      "MEN": 7,
-      "LUC": 13
-    },
-    "3_2": {
-      "STR": 9,
-      "DEX": 6,
-      "CON": 7,
-      "INT": 15,
-      "WIT": 12,
-      "MEN": 12,
-      "LUC": 13
-    },
-    "4_1": {
-      "STR": 14,
-      "DEX": 11,
-      "CON": 15,
-      "INT": 6,
-      "WIT": 8,
-      "MEN": 7,
-      "LUC": 12
-    },
-    "4_2": {
-      "STR": 8,
-      "DEX": 6,
-      "CON": 6,
-      "INT": 14,
-      "WIT": 11,
-      "MEN": 15,
-      "LUC": 12
-    },
-    "5_1": {
-      "STR": 13,
-      "DEX": 11,
-      "CON": 14,
-      "INT": 6,
-      "WIT": 6,
-      "MEN": 7,
-      "LUC": 15
-    },
-    "5_2": {
-      "STR": 8,
-      "DEX": 7,
-      "CON": 8,
-      "INT": 12,
-      "WIT": 12,
-      "MEN": 12,
-      "LUC": 15
-    },
-    "6_1": {
-      "STR": 14,
-      "DEX": 14,
-      "CON": 11,
-      "INT": 8,
-      "WIT": 7,
-      "MEN": 7,
-      "LUC": 14
-    },
-    "6_2": {
-      "STR": 8,
-      "DEX": 7,
-      "CON": 6,
-      "INT": 14,
-      "WIT": 14,
-      "MEN": 11,
-      "LUC": 14
-    }
+  "humanBase": {
+    "STR": 10,
+    "DEX": 10,
+    "CON": 10,
+    "INT": 10,
+    "WIT": 10,
+    "MEN": 10,
+    "LUC": 10
   },
   "statNeutral": 10,
   "statInfluence": {
@@ -235,5 +135,33 @@
     "minChance": 0.03,
     "maxChance": 0.8,
     "defaultPower": 1.5
+  },
+  "progression": {
+    "attributePointsPerLevel": 1,
+    "talentPointsPerLevel": 1,
+    "craftExperience": 15,
+    "practicePerRank": 8,
+    "talentBonusPerRank": 0.02,
+    "levelGrowth": 1.15
+  },
+  "life": {
+    "lives": 10,
+    "knockSeconds": 5,
+    "riseFraction": 0.05,
+    "loss": 0.2,
+    "returnSeconds": 30,
+    "returnRadius": 12,
+    "offlineSeconds": 1800
+  },
+  "work": {
+    "nodeStock": 20,
+    "growSeconds": 30,
+    "harvest": 3,
+    "freshSeconds": 600,
+    "saltedSeconds": 7200,
+    "hungerPerMinute": 1,
+    "starveEverySeconds": 10,
+    "meal": 40,
+    "drink": 40
   }
 }

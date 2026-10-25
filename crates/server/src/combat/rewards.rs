@@ -10,8 +10,9 @@ pub(super) struct Defeat {
     pub name: String,
     pub kind: Kind,
 }
-pub(super) fn roll_drops(class: u8, kind: Kind, random: fn() -> f64) -> Vec<u8> {
-    // New encounter materials are guaranteed; recipes remain available in the shop.
+/// `magical`: the killer fought with a staff, so the weapon drop is a staff.
+pub(super) fn roll_drops(magical: bool, kind: Kind, random: fn() -> f64) -> Vec<u8> {
+    // New encounter materials are guaranteed.
     if kind == Kind::Marauder {
         return vec![crafting::IRON, crafting::LEATHER];
     }
@@ -20,13 +21,15 @@ pub(super) fn roll_drops(class: u8, kind: Kind, random: fn() -> f64) -> Vec<u8> 
     }
     let mut drops = vec![7, crafting::LEATHER];
     if random() < 0.3 {
-        drops.push(if class == 2 { 5 } else { 4 });
+        drops.push(if magical { 5 } else { 4 });
     }
     if random() < 0.2 {
         drops.push(6);
     }
     drops
 }
+/// Experience applies at once; drops and coins are queued in `grants` and become physical
+/// stacks when the owner's connection commits them (bag, or the ground when overloaded).
 pub(super) fn grant_share(
     actor: &mut Actor,
     fighter: &mut Fighter,
@@ -34,21 +37,17 @@ pub(super) fn grant_share(
     coins: u32,
     drops: &[u8],
     grouped: bool,
-    kind: Kind,
+    grants: &mut Vec<(u8, u32)>,
 ) {
-    let experience = if actor.progress.level < 100 {
-        experience
-    } else {
-        0
-    };
-    let gain =
-        actor
-            .progress
-            .reward_enemy(&mut fighter.stats, experience, coins, kind == Kind::Bandit);
+    let gain = actor.progress.reward_share(&mut fighter.stats, experience);
     actor.reward_status = format!(
-        "{}+{experience} опыта · +{coins} монет",
-        if grouped { "Группа: " } else { "" }
+        "{}+{experience} опыта · +{}",
+        if grouped { "Группа: " } else { "" },
+        items::format_coins(coins.into())
     );
+    if coins > 0 {
+        grants.push((items::COPPER, coins));
+    }
     if gain > 0 {
         actor.max_hp = stat(&fighter.stats, "hp");
         actor.hp = actor.max_hp;
@@ -59,8 +58,7 @@ pub(super) fn grant_share(
             .push_str(&format!(" · Уровень {}!", actor.progress.level));
     }
     for &kind in drops {
-        let quantity = actor.loot.entry(kind).or_default();
-        *quantity = quantity.saturating_add(1);
+        grants.push((kind, 1));
         actor
             .reward_status
             .push_str(&format!(" · {} ×1", items::definition(kind).unwrap().name));
@@ -72,13 +70,18 @@ pub(super) fn distribute(
     parties: &mut Parties,
     defeats: &mut Vec<Defeat>,
     random: fn() -> f64,
+    grants: &mut HashMap<i64, Vec<(u8, u32)>>,
 ) {
     for defeat in defeats.drain(..) {
-        let Some(fighter) = fighters.get(&defeat.killer) else {
+        if !fighters.contains_key(&defeat.killer) {
             continue;
-        };
-        // One drop roll per enemy, using the finisher's class as in solo combat.
-        let drops = roll_drops(fighter.class, defeat.kind, random);
+        }
+        // One drop roll per enemy, using the finisher's weapon as in solo combat.
+        let magical = actors
+            .iter()
+            .find(|a| a.id == defeat.killer)
+            .is_some_and(|a| mortown_protocol::weapons::magical(a.equipment.weapon));
+        let drops = roll_drops(magical, defeat.kind, random);
         let spec = defeat.kind.definition();
         let plan = parties.reward_plan(defeat.killer, defeat.position, actors, drops.len());
         let count = plan.members.len() as u32;
@@ -124,7 +127,7 @@ pub(super) fn distribute(
                 coins,
                 &owned,
                 plan.party.is_some(),
-                defeat.kind,
+                grants.entry(*id).or_default(),
             );
         }
         if let Some(party) = plan.party {

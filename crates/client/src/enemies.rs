@@ -175,10 +175,9 @@ fn effect_color(m: &mortown_protocol::Monster, selected: bool, hit: bool) -> Opt
         return Some(match effect.kind {
             StatusKind::Bleeding => 3,
             StatusKind::Burning => 4,
-            StatusKind::Poisoned | StatusKind::Corroded => 5,
-            StatusKind::Blinded | StatusKind::Stunned => 6,
+            StatusKind::Poisoned => 5,
+            StatusKind::Blinded => 6,
             StatusKind::Crippled | StatusKind::Quicksand => 7,
-            StatusKind::Smoke => 2,
         });
     }
     if m.slow_ms > 0 {

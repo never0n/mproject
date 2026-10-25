@@ -17,6 +17,10 @@ __pycache__/
 # Blender autosave backups
 *.blend[0-9]
 
+# Above GitHub's 100 MB limit. Kept locally.
+assets/creatures/rivermoor_clay/rivermoor_clay_v2.blend
+assets/creatures/rivermoor_textured/rivermoor_textured.blend
+
 # Editors and OS
 .idea/
 .vscode/

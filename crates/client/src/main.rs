@@ -1,3 +1,7 @@
+//! Mortown desktop client entry point.
+//! Builds the single Bevy `App`: global resources, Startup/Update/PostUpdate system order
+//! (no custom plugins), plus the core controls: camera orbit, click-to-move/select and player movement.
+//! Server state arrives via `network::receive`; world geometry comes from `mortown_world` (`Terrain`).
 #![allow(clippy::type_complexity, clippy::too_many_arguments)]
 
 mod action_fx;
@@ -9,30 +13,26 @@ mod character;
 mod chat;
 mod combat;
 mod crafting;
-mod dialogue;
 mod enemies;
 mod exchange;
+mod foundry;
 mod inventory;
-mod journal;
 mod lobby;
-mod mail;
 mod menu;
 mod movable;
 mod network;
-mod npcs;
+mod objects;
 mod party;
 mod player_motion;
 mod preview;
-mod residents;
 mod scene;
 mod shutdown;
 mod skill_effects;
 mod skills;
 mod skin;
+mod stations;
 mod target;
-mod trade;
 mod ui;
-mod warehouse;
 mod weapon_pose;
 
 use bevy::{
@@ -48,12 +48,17 @@ use mortown_world::height;
 use mortown_world::{World, navigation::find_path};
 use std::{collections::VecDeque, sync::Arc};
 
+/// Shared world geometry, identical to the server's. `Arc` lets background pathfinding tasks
+/// hold the same data without copying it.
 #[derive(Resource, Clone)]
 struct Terrain(Arc<World>);
 
+/// Marker for the local hero entity (spawned in `scene::setup`).
 #[derive(Component)]
 struct Player;
 
+/// Third-person camera state in radians/meters. `distance` is the zoom target,
+/// `current_distance` is the smoothed value actually used by `update_camera`.
 #[derive(Resource)]
 struct Orbit {
     yaw: f32,
@@ -62,18 +67,25 @@ struct Orbit {
     current_distance: f32,
 }
 
+/// Click-to-move state shared by many modules (combat can start or cancel routes).
+/// `path` holds remaining `[x, z]` waypoints; `pending` is the background `find_path` task;
+/// `status` is the route text shown in the HUD.
 #[derive(Resource, Default)]
 struct Movement {
     path: VecDeque<[f32; 2]>,
     pending: Option<Task<Result<Vec<[f32; 2]>, mortown_world::navigation::PathError>>>,
     destination: Option<[f32; 2]>,
     status: String,
+    // Accumulated walked distance; currently written but never read.
     travelled: f32,
 }
 
+/// Ring shown on the ground at the click-to-move destination.
 #[derive(Component)]
 struct DestinationMarker;
 
+/// Command-line flags for offline previews and automated screenshots
+/// (`--view`, `--ui-preview`, `--capture`, `--exit-after`); `frame` counts Update runs.
 #[derive(Resource, Default)]
 struct RunOptions {
     view: String,
@@ -83,6 +95,7 @@ struct RunOptions {
     exit_after: Option<u32>,
 }
 
+/// Prefers an `assets/` folder next to the executable (packaged build), otherwise the repo's `assets/`.
 fn asset_directory() -> String {
     let packaged = std::env::current_exe()
         .ok()
@@ -94,6 +107,7 @@ fn asset_directory() -> String {
         .into_owned()
 }
 
+/// Registers everything. Order inside the `.chain()` groups is the real per-frame execution order.
 fn main() {
     let args: Vec<_> = std::env::args().collect();
     let value = |flag: &str| args.windows(2).find(|a| a[0] == flag).map(|a| a[1].clone());
@@ -115,7 +129,6 @@ fn main() {
             current_distance: 18.0,
         })
         .init_resource::<Movement>()
-        .add_message::<npcs::ServiceRequest>()
         .init_resource::<shutdown::Requested>()
         .init_resource::<network::Network>()
         .init_resource::<lobby::Form>()
@@ -140,6 +153,7 @@ fn main() {
                     ..default()
                 }),
         )
+        // Later setups need resources/entities from earlier ones (e.g. `actionbar::setup` creates `Icons`).
         .add_systems(
             Startup,
             (
@@ -149,23 +163,22 @@ fn main() {
                 actionbar::setup,
                 inventory::setup,
                 crafting::setup,
+                foundry::setup,
                 combat::setup,
-                (trade::setup, npcs::setup).chain(),
                 skills::setup,
-                mail::setup,
                 menu::setup,
                 skill_effects::setup,
-                journal::setup,
                 target::setup,
-                dialogue::setup,
                 exchange::setup,
+                objects::setup,
                 (chat::setup, chat::windows::setup).chain(),
                 party::setup,
-                (alliance::setup, warehouse::setup).chain(),
+                alliance::setup,
                 movable::setup,
             )
                 .chain(),
         )
+        // Model/visual setups run once all UI windows exist.
         .add_systems(
             Startup,
             (
@@ -175,11 +188,12 @@ fn main() {
                 ancestry::setup,
                 enemies::setup,
                 action_fx::setup,
-                residents::setup,
+                stations::setup,
             )
                 .chain()
                 .after(movable::setup),
         )
+        // One strict chain: network state first, text input before hotkeys, movement before camera.
         .add_systems(
             Update,
             (
@@ -197,9 +211,9 @@ fn main() {
                 (
                     preview::gallery,
                     preview::hover,
+                    // Chat must consume keystrokes before any game hotkey system sees them.
                     (chat::admin::input, chat::windows::input, chat::input).chain(),
                     alliance::input,
-                    warehouse::input,
                     skin::close,
                     skin::scale,
                 )
@@ -209,14 +223,12 @@ fn main() {
                     target::input,
                     party::input,
                     menu::input,
-                    dialogue::input,
                     exchange::input,
-                    journal::input,
-                    mail::input,
+                    objects::input,
                     inventory::input,
-                    (trade::input, trade::scroll).chain(),
                     skills::input,
                     crafting::input,
+                    foundry::input,
                 )
                     .chain(),
                 (
@@ -227,33 +239,32 @@ fn main() {
                     .chain(),
                 (
                     crafting::display,
+                    foundry::display,
                     inventory::display,
-                    trade::display,
                     skills::display,
-                    mail::display,
                     menu::display,
-                    journal::display,
                     exchange::display,
+                    objects::display,
+                    objects::sync,
                     chat::display,
                     party::display,
                     alliance::display,
-                    warehouse::display,
                 )
                     .chain(),
                 (
                     combat::input,
                     combat::display,
-                    (npcs::sync, enemies::sync).chain(),
+                    enemies::sync,
                     enemies::glow,
                     skill_effects::display,
                     actionbar::input,
                     actionbar::display,
-                    warehouse::hints,
                 )
                     .chain(),
                 camera_input,
-                (click_destination, target::display, dialogue::display).chain(),
+                (click_destination, target::display).chain(),
                 move_player,
+                // Model preparation: skeleton, equipment, body shape, then pose data for this frame.
                 (
                     character::initialize,
                     appearance::prepare,
@@ -261,7 +272,6 @@ fn main() {
                     ancestry::prepare,
                     ancestry::display,
                     appearance::display,
-                    residents::prepare,
                     enemies::prepare,
                     player_motion::prepare,
                     player_motion::sync,
@@ -270,14 +280,17 @@ fn main() {
                 )
                     .chain(),
                 character::animate,
+                // After `move_player`, so the camera follows this frame's position without lag.
                 update_camera,
-                (scene::update_visibility, npcs::labels).chain(),
+                scene::update_visibility,
                 ui::update,
                 ui::button_feedback,
                 (shutdown::update, capture_and_exit).chain(),
             )
                 .chain(),
         )
+        // Bone overrides: after the animation player writes bones, before transforms propagate
+        // to rendering. Earlier would be overwritten by animation; later would show a frame late.
         .add_systems(
             PostUpdate,
             ancestry::pose
@@ -322,12 +335,6 @@ fn main() {
         )
         .add_systems(
             PostUpdate,
-            residents::pose
-                .after(weapon_pose::pose)
-                .before(bevy::transform::TransformSystems::Propagate),
-        )
-        .add_systems(
-            PostUpdate,
             ancestry::frame_preview
                 .after(ancestry::pose)
                 .before(bevy::transform::TransformSystems::Propagate),
@@ -335,6 +342,8 @@ fn main() {
         .run();
 }
 
+/// Mouse/keyboard camera control: RMB drag orbits, wheel zooms, F toggles overview, Home resets.
+/// Only changes `Orbit`; `update_camera` applies it.
 #[allow(clippy::too_many_arguments)]
 fn camera_input(
     mouse: Res<AccumulatedMouseMotion>,
@@ -352,10 +361,13 @@ fn camera_input(
         return;
     }
     if buttons.pressed(MouseButton::Right) {
+        // 0.004 rad per pixel; pitch kept between just above horizon and almost straight down.
         orbit.yaw -= mouse.delta.x * 0.004;
         orbit.pitch = (orbit.pitch + mouse.delta.y * 0.004).clamp(0.06, 1.53);
     }
+    // Multiplicative zoom: each wheel notch scales distance by ~16%, so it feels even near and far.
     orbit.distance = (orbit.distance * (-scroll.delta.y * 0.16).exp()).clamp(4.0, 2200.0);
+    // 500 m splits "normal" view from the bird's-eye overview.
     if keys.just_pressed(KeyCode::KeyF) {
         if orbit.distance > 500.0 {
             orbit.distance = 18.0;
@@ -372,6 +384,8 @@ fn camera_input(
     }
 }
 
+/// Left click in the world: selects the closest monster/player under the cursor,
+/// otherwise picks a ground point and starts background pathfinding.
 #[allow(clippy::too_many_arguments)]
 fn click_destination(
     buttons: Res<ButtonInput<MouseButton>>,
@@ -387,7 +401,7 @@ fn click_destination(
     world: Res<Terrain>,
     mut movement: ResMut<Movement>,
     mut network: ResMut<network::Network>,
-    mut panel: ResMut<ui::CharacterWindow>,
+    panel: Res<ui::CharacterWindow>,
     mut combat: ResMut<combat::CombatUi>,
     drag: Res<movable::DragState>,
     hud: Query<
@@ -412,8 +426,9 @@ fn click_destination(
     }) {
         return;
     }
-    // Pick the closest visible actor under the cursor, including town residents.
-    let mut candidates: Vec<(f32, Option<u32>, Option<i64>, Option<u8>)> = Vec::new();
+    // Pick the closest visible actor under the cursor.
+    // Tuple: (score, monster id, player id); exactly one id is set. Lower score wins.
+    let mut candidates: Vec<(f32, Option<u32>, Option<i64>)> = Vec::new();
     for m in network.monsters.iter().filter(|m| m.hp > 0.) {
         let feet = Vec3::from_array(m.position);
         if feet.distance(player.translation) > 60.
@@ -428,74 +443,36 @@ fn click_destination(
             camera.0.world_to_viewport(camera.1, feet + Vec3::Y * 0.1),
             camera.0.world_to_viewport(camera.1, feet + Vec3::Y * 2.05),
         ) {
+            // Distance from cursor to the on-screen feet→head segment; hit radius is 20% of its
+            // length (8–36 px). Score is normalized so 23 = edge of the hit radius.
             let axis = top - bottom;
             let t = ((cursor - bottom).dot(axis) / axis.length_squared().max(0.01)).clamp(0., 1.);
             let distance = cursor.distance(bottom + axis * t);
             let radius = (axis.length() * 0.20).clamp(8., 36.);
             if distance <= radius {
-                candidates.push((distance / radius * 23., Some(m.id), None, None));
+                candidates.push((distance / radius * 23., Some(m.id), None));
             }
         }
     }
+    // Other players: raw pixel distance to their chest point (no range or sight check).
     for a in &network.roster {
         if let Ok(p) = camera
             .0
             .world_to_viewport(camera.1, Vec3::from_array(a.position) + Vec3::Y)
         {
-            candidates.push((p.distance(cursor), None, Some(a.id), None));
+            candidates.push((p.distance(cursor), None, Some(a.id)));
         }
     }
-    for state in &network.residents {
-        let Some(npc) = npcs::resolve(&network, state.id) else {
-            continue;
-        };
-        let from = network
-            .authoritative
-            .as_ref()
-            .map(|a| a.position)
-            .unwrap_or(player.translation.to_array());
-        if !npc.same_room(&world.0, from) {
-            continue;
-        }
-        let point = Vec3::from_array(npc.feet(&world.0)) + Vec3::Y;
-        if point.distance(player.translation) > 60.
-            || !world
-                .0
-                .sight_clear(camera.1.translation().to_array(), point.to_array())
-        {
-            continue;
-        }
-        let feet = point - Vec3::Y;
-        let body_height = if npc.race == 5 { 1.5 } else { 1.9 };
-        if let (Ok(bottom), Ok(top)) = (
-            camera.0.world_to_viewport(camera.1, feet + Vec3::Y * 0.15),
-            camera
-                .0
-                .world_to_viewport(camera.1, feet + Vec3::Y * body_height),
-        ) {
-            // The whole silhouette is clickable, including the head and shorter races.
-            let axis = top - bottom;
-            let t = ((cursor - bottom).dot(axis) / axis.length_squared().max(0.01)).clamp(0., 1.);
-            let distance = cursor.distance(bottom + axis * t);
-            let radius = (axis.length() * 0.20).clamp(8., 36.);
-            if distance <= radius {
-                candidates.push((distance / radius * 23., None, None, Some(npc.id)));
-            }
-        }
-    }
-    if let Some((_, monster, actor, npc)) = candidates
+    if let Some((_, monster, actor)) = candidates
         .into_iter()
         .filter(|(d, ..)| *d < 24.)
         .min_by(|a, b| a.0.total_cmp(&b.0))
     {
         combat.selected = monster;
         combat.player = actor;
-        combat.npc = npc;
-        if actor.is_some() || npc.is_some() {
+        // Selecting a non-enemy stops auto-attack on the server.
+        if actor.is_some() {
             network.action(mortown_protocol::ClientMessage::Attack { target: None });
-        }
-        if let Some(id) = npc {
-            dialogue::open(id, &mut panel, &mut network, &mut movement, &world.0);
         }
         return;
     }
@@ -506,6 +483,7 @@ fn click_destination(
         movement.status = "Выберите точку на земле".into();
         return;
     };
+    // Route starts from the server position when online (the visible hero may lag slightly behind).
     let from = network
         .authoritative
         .as_ref()
@@ -529,13 +507,16 @@ fn click_destination(
     movement.path.clear();
     movement.destination = Some(to);
     movement.status = "Прокладываем маршрут…".into();
+    // A* can be slow on a large map, so it runs off the main thread; `move_player` polls the result.
     movement.pending =
         Some(AsyncComputeTaskPool::get().spawn(async move { find_path(&world, from, to) }));
 }
 
+/// Where a camera ray first meets the ground/floor surface, or `None` if it never does.
 fn terrain_hit(origin: Vec3, direction: Vec3, world: &mortown_world::World) -> Option<Vec3> {
     let mut last = origin;
     // Fine near the camera, larger steps at distance; refine the first crossing.
+    // Step = 0.8% of distance, 0.4–8 m; 24 km max covers the whole ±8 km map; 14 bisections ≈ mm precision.
     let mut distance = 0.0_f32;
     while distance < 24000.0 {
         distance += (distance * 0.008).clamp(0.4, 8.0);
@@ -558,6 +539,9 @@ fn terrain_hit(origin: Vec3, direction: Vec3, world: &mortown_world::World) -> O
     None
 }
 
+/// WASD and click-route movement. Online: only sends a target to the server (`Network::intent`);
+/// the hero is moved by `network::receive`. Offline (`--view`): moves the hero locally with collision.
+/// `network`/`panel` are `Option` so unit tests can run this system without those resources.
 // Explicit disjoint query filters prevent conflicting mutable Transform access.
 #[allow(clippy::type_complexity, clippy::too_many_arguments)]
 fn move_player(
@@ -607,6 +591,7 @@ fn move_player(
         }
     }
     let pos = Vec2::new(player.translation.x, player.translation.z);
+    // Camera-relative axes on the ground plane (x, z), derived from the orbit yaw.
     let right = Vec2::new(orbit.yaw.cos(), -orbit.yaw.sin());
     let forward = Vec2::new(-orbit.yaw.sin(), -orbit.yaw.cos());
     let delta = if input != Vec2::ZERO {
@@ -614,6 +599,8 @@ fn move_player(
     } else {
         Vec2::ZERO
     };
+    // m/s; mirrors protocol WALK_SPEED/RUN_SPEED but only drives offline movement.
+    // Online, `speed < 7.` just tells the server "walking".
     let speed = if keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight) {
         5.0
     } else {
@@ -622,6 +609,7 @@ fn move_player(
     if let Some(net) = network.as_mut().filter(|n| n.mode == network::Mode::Online) {
         if let Some(actor) = &net.authoritative {
             let position = [actor.position[0], actor.position[2]];
+            // Waypoints within 15 cm of the server position count as reached.
             while movement
                 .path
                 .front()
@@ -629,6 +617,7 @@ fn move_player(
             {
                 movement.path.pop_front();
             }
+            // WASD sends a "carrot" 2 m ahead; far enough to keep moving between 45 ms messages.
             let target = if input != Vec2::ZERO {
                 [position[0] + delta.x * 2., position[1] + delta.y * 2.]
             } else {
@@ -648,6 +637,7 @@ fn move_player(
         }
         return;
     }
+    // Offline path below. dt capped at 0.1 s so a frame hitch can't jump through a wall.
     let step = speed * time.delta_secs().min(0.1);
     let mut reached_waypoint = false;
     let desired = if input == Vec2::ZERO
@@ -671,6 +661,7 @@ fn move_player(
             movement.path.pop_front();
         }
     } else if input != Vec2::ZERO {
+        // Wall sliding: keep only the X or only the Z part of the step (same rule as server `advance`).
         for candidate in [Vec2::new(desired.x, pos.y), Vec2::new(pos.x, desired.y)] {
             if world.0.segment_clear(pos.to_array(), candidate.to_array()) {
                 next = candidate;
@@ -699,6 +690,8 @@ fn move_player(
     }
 }
 
+/// Places the orbit camera around the hero, pulling it closer when a wall or hill
+/// would block the view.
 #[allow(clippy::type_complexity)]
 fn update_camera(
     time: Res<Time>,
@@ -715,8 +708,10 @@ fn update_camera(
         ),
     >,
 ) {
+    // Frame-rate independent zoom smoothing (rate 8 per second).
     orbit.current_distance +=
         (orbit.distance - orbit.current_distance) * (1.0 - (-time.delta_secs() * 8.0).exp());
+    // Look at chest height; `dir` points from the hero toward the camera (spherical coords from yaw/pitch).
     let target = player.translation + Vec3::Y * 1.5;
     let dir = Vec3::new(
         orbit.yaw.sin() * orbit.pitch.cos(),
@@ -725,6 +720,7 @@ fn update_camera(
     );
     let mut distance = orbit.current_distance;
     let in_hall = world.0.hall_at(target.x, target.z);
+    // Skip small details and the roof of the hall we're standing in (it is hidden anyway).
     for block in &world.0.blocks {
         if !block.camera_solid
             || block.detail
@@ -733,7 +729,9 @@ fn update_camera(
             continue;
         }
         let center = Vec3::from_array(block.center);
+        // Box grown by 0.25 m so the near plane doesn't clip into the wall.
         let half = Vec3::from_array(block.size) * 0.5 + Vec3::splat(0.25);
+        // Rotate the ray into the block's local frame so the box test can be axis-aligned.
         let inverse = Quat::from_rotation_y(-block.yaw);
         if let Some(hit) = ray_box(inverse * (target - center), inverse * dir, -half, half) {
             distance = distance.min((hit - 0.25).max(0.5));
@@ -752,6 +750,8 @@ fn update_camera(
     **camera = Transform::from_translation(target + dir * distance).looking_at(target, Vec3::Y);
 }
 
+/// Slab test: distance along the ray to an axis-aligned box, `None` if missed or behind.
+/// Returns 0 when the origin is already inside the box.
 fn ray_box(origin: Vec3, direction: Vec3, min: Vec3, max: Vec3) -> Option<f32> {
     let mut near = 0.0_f32;
     let mut far = f32::INFINITY;
@@ -773,6 +773,8 @@ fn ray_box(origin: Vec3, direction: Vec3, min: Vec3, max: Vec3) -> Option<f32> {
     (far >= 0.0).then_some(near)
 }
 
+/// Screenshot/auto-exit helper for previews: captures at frame 100 (and every 120 frames in the
+/// gallery) or on Ctrl+Shift+F12 when `--capture` is set; quits after `--exit-after` frames.
 fn capture_and_exit(
     mut commands: Commands,
     mut options: ResMut<RunOptions>,
@@ -802,6 +804,7 @@ fn capture_and_exit(
 mod tests {
     use super::*;
 
+    /// Minimal headless app running only `move_player` (offline path), with a fixed 100 ms frame.
     fn movement_app(at: [f32; 2]) -> App {
         let mut app = App::new();
         let mut time = Time::<()>::default();
@@ -815,7 +818,6 @@ mod tests {
                 current_distance: 18.0,
             })
             .init_resource::<Movement>()
-            .add_message::<npcs::ServiceRequest>()
             .init_resource::<ButtonInput<KeyCode>>()
             .add_systems(Update, move_player);
         app.world_mut().spawn((

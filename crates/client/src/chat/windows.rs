@@ -1,7 +1,11 @@
 //! Native chat command dialogs share the game's movable window chrome.
+//! The server opens them (`Reply::Dialog` → `Log::dialog`): help, ignore list, confirm,
+//! game/chat settings, admin panel. `input` rebuilds the whole window whenever the dialog
+//! (or the admin board) changes; settings buttons act locally on the window and lights.
 use super::*;
 use bevy::window::{MonitorSelection, PresentMode, PrimaryWindow, WindowMode};
 use mortown_protocol::chat::{Dialog, DialogKind};
+/// Chat look; client-only and not saved (reset on restart).
 #[derive(Resource)]
 pub struct Settings {
     pub font: f32,
@@ -17,12 +21,14 @@ impl Default for Settings {
         }
     }
 }
+/// What is currently spawned: overlay root, inner panel, and the dialog it was built from.
 #[derive(Resource, Default)]
 pub struct State {
     entity: Option<Entity>,
     panel: Option<Entity>,
     rendered: Option<Dialog>,
 }
+/// Dialog buttons; `Font`/`Width` carry the step to add.
 #[derive(Component, Clone, Copy)]
 pub enum DialogAction {
     Close,
@@ -60,6 +66,7 @@ fn control(action: DialogAction) -> impl Bundle {
         BorderColor::all(crate::ui::EDGE),
     )
 }
+/// Runs before `chat::input`; sets `Form::modal_capture` so the chat yields the keyboard.
 pub fn input(
     mut commands: Commands,
     mut network: ResMut<Network>,
@@ -109,6 +116,7 @@ pub fn input(
         };
         match action {
             Some(DialogAction::Close) => network.chat.dialog = None,
+            // Dangerous commands come back as Confirm with a one-time token; sending it executes.
             Some(DialogAction::Confirm) if !network.chat.pending => {
                 if let Some(dialog) = network.chat.dialog.take()
                     && let Some(token) = dialog.token
@@ -152,6 +160,7 @@ pub fn input(
             }
             _ => {}
         }
+        // Keys held while closing (e.g. Escape) must not reach the game.
         if matches!(action, Some(DialogAction::Close)) {
             form.suppressed.extend(keys.get_pressed().copied());
             keys.reset_all();
@@ -171,6 +180,7 @@ pub fn input(
         .as_ref()
         .is_some_and(|d| d.kind == DialogKind::Admin)
         && board.revision != board.rendered;
+    // Rebuild on change. Same dialog kind → keep the dragged position and scroll offset.
     if state.rendered != network.chat.dialog || admin_changed {
         let keep = state
             .rendered
@@ -211,9 +221,12 @@ pub fn input(
                         ..default()
                     },
                     BackgroundColor(Color::srgba(0., 0., 0., 0.35)),
+                    // Topmost layer: above the ⚙ menu (40).
                     GlobalZIndex(80),
                 ))
                 .with_children(|overlay| {
+                    // Spawned at runtime, so it adds its own Movable + Handle
+                    // (`movable::setup` only sees windows that exist at startup).
                     let mut panel = overlay.spawn((
                         crate::movable::Movable,
                         crate::ui::WorldInputBlocker,
@@ -389,6 +402,7 @@ pub fn input(
             state.panel = next_panel;
         }
     }
+    // Settings summary is refreshed every frame from the live window/lights state.
     if let Some(dialog) = &network.chat.dialog {
         for mut text in &mut labels {
             text.0 = if dialog.kind == DialogKind::GameSettings {

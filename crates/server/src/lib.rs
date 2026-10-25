@@ -1,14 +1,21 @@
 mod alliance;
-mod alliance_storage;
+pub mod build;
+mod casting;
 mod chat;
 pub mod combat;
 mod console;
+pub mod crafting_physics;
 pub mod economy;
 mod exchange;
-pub mod mail;
+mod inventory;
+pub mod legacy;
+mod life;
+mod objects;
 mod party;
 pub mod simulation;
+mod society;
 pub mod store;
+mod work;
 
 use axum::{
     Router,
@@ -19,7 +26,9 @@ use axum::{
     response::IntoResponse,
     routing::get,
 };
-use mortown_protocol::{ClientMessage, PROTOCOL_VERSION, ServerMessage, WORLD_VERSION};
+use mortown_protocol::{
+    ClientMessage, PROTOCOL_VERSION, ServerMessage, VERSION_MISMATCH, WORLD_VERSION,
+};
 use simulation::Simulation;
 use sqlx::{PgPool, postgres::PgPoolOptions};
 use std::{
@@ -33,8 +42,11 @@ pub struct Server {
     pub pool: PgPool,
     pub simulation: Arc<Mutex<Simulation>>,
     chat: tokio::sync::broadcast::Sender<chat::Delivery>,
+    hearing: tokio::sync::broadcast::Sender<(Vec<i64>, i64, String)>,
     alliance_events: watch::Sender<()>,
     admin_events: watch::Sender<()>,
+    /// Ground stacks or containers changed somewhere; sessions resend their nearby list.
+    object_events: watch::Sender<()>,
     announcements: tokio::sync::broadcast::Sender<String>,
     snapshots: watch::Receiver<ServerMessage>,
     shutdown: watch::Receiver<bool>,
@@ -52,16 +64,42 @@ impl Server {
             .connect(database_url)
             .await?;
         sqlx::migrate!("./migrations").run(&pool).await?;
+        store::convert_legacy_characters(&mut *pool.acquire().await?).await?;
         let terrain = Arc::new(mortown_world::World::new());
-        let simulation = Arc::new(Mutex::new(Simulation::new(terrain)));
+        let converted = store::convert_legacy_items(&mut *pool.acquire().await?, &terrain).await?;
+        if converted > 0 {
+            println!("Старые инвентари переведены в физические вещи: {converted} персонажей");
+        }
+        let progressed = store::convert_legacy_progress(&mut *pool.acquire().await?).await?;
+        if progressed > 0 {
+            println!("Старый прогресс переведён: {progressed} персонажей");
+        }
+        work::seed(&pool, &terrain).await?;
+        build::grant_pool(&pool).await?;
+        let kept = legacy::report(&mut *pool.acquire().await?).await?;
+        if kept.records > 0 {
+            println!(
+                "Сохранено до физических хранилищ: {} записей, {} предметов, {} монет, владельцев: {}",
+                kept.records, kept.items, kept.coins, kept.owners
+            );
+        }
+        let mut simulation_state = Simulation::new(terrain);
+        if let Ok(mut conn) = pool.acquire().await
+            && let Ok(blocks) = build::all(&mut conn).await
+        {
+            simulation_state.set_blocks(blocks);
+        }
+        let simulation = Arc::new(Mutex::new(simulation_state));
         let (tx, snapshots) = watch::channel(ServerMessage::Snapshot {
             tick: 0,
             actors: vec![],
             monsters: vec![],
-            residents: simulation.lock().await.residents.clone(),
             areas: vec![],
         });
+        let (object_events, _) = watch::channel(());
         let sim = simulation.clone();
+        let death_pool = pool.clone();
+        let moved = object_events.clone();
         let mut stop = shutdown.clone();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_millis(50));
@@ -70,8 +108,44 @@ impl Server {
                 tokio::select! {
                     _ = stop.changed() => break,
                     _ = tick.tick() => {
-                        let mut s = sim.lock().await; s.update();
-                        tx.send_replace(ServerMessage::Snapshot { tick: s.tick(), actors: s.snapshot(), monsters:s.monsters(), residents:s.residents.clone(), areas: s.areas() });
+                        let (deaths, expired, terrain) = {
+                            let mut s = sim.lock().await;
+                            s.update();
+                            let terrain = s.tick().is_multiple_of(20).then(|| s.terrain());
+                            (s.take_deaths(), s.expired_offline(), terrain)
+                        };
+                        if let Some(terrain) = terrain
+                            && society::fly(&death_pool, &terrain).await.unwrap_or(false)
+                        {
+                            moved.send_replace(());
+                        }
+                        for actor in deaths {
+                            let mut settled = false;
+                            if let Ok(changed) = life::apply(&death_pool, actor.death_mark, actor.id).await {
+                                settled = changed.is_none();
+                                if changed.is_some()
+                                    && let Ok(mut conn) = death_pool.acquire().await
+                                    && let Ok(sheet) = store::sheet(&mut conn, actor.id).await
+                                {
+                                    sim.lock().await.finish_death(&sheet);
+                                    settled = true;
+                                }
+                            }
+                            if !settled {
+                                sim.lock().await.mark_pending(actor.id);
+                            }
+                        }
+                        for actor in expired {
+                            if !sim.lock().await.still_offline(actor.id) {
+                                continue;
+                            }
+                            if let Ok(mut conn) = death_pool.acquire().await {
+                                let _ = store::save(&mut conn, &actor).await;
+                            }
+                            sim.lock().await.retire_offline(&[actor.id]);
+                        }
+                        let s = sim.lock().await;
+                        tx.send_replace(ServerMessage::Snapshot { tick: s.tick(), actors: s.snapshot(), monsters:s.monsters(), areas: s.areas() });
                     }
                 }
             }
@@ -80,11 +154,14 @@ impl Server {
         let (alliance_events, _) = watch::channel(());
         let (admin_events, _) = watch::channel(());
         let (announcements, _) = tokio::sync::broadcast::channel(32);
+        let (hearing, _) = tokio::sync::broadcast::channel(64);
         Ok(Self {
             admin_events,
+            object_events,
             announcements,
             alliance_events,
             chat,
+            hearing,
             pool,
             simulation,
             snapshots,
@@ -165,7 +242,7 @@ async fn session(mut socket: WebSocket, server: Server, ip: Option<String>) {
         _ => false,
     };
     if !version_ok {
-        error(&mut socket, "Обновите клиент: версия мира не совпадает").await;
+        error(&mut socket, VERSION_MISMATCH).await;
         return;
     }
     let account = match message {
@@ -284,25 +361,18 @@ async fn character_lobby(
         }
         let result = match message {
             Message::Text(text) => match serde_json::from_str::<ClientMessage>(&text) {
-                Ok(ClientMessage::CreateCharacter {
-                    nickname,
-                    race,
-                    class,
-                    gender,
-                }) => {
+                Ok(ClientMessage::CreateCharacter { nickname, gender }) => {
                     match store::create_character(
                         conn,
                         account,
-                        store::CharacterCreation {
-                            nickname,
-                            race,
-                            class,
-                            gender,
-                        },
+                        store::CharacterCreation { nickname, gender },
                     )
                     .await
                     {
-                        Ok(id) => character_list(socket, conn, account, Some(id)).await,
+                        Ok(id) => {
+                            let _ = build::grant_starting_plots(conn).await;
+                            character_list(socket, conn, account, Some(id)).await
+                        }
                         Err(e) => Err(e),
                     }
                 }
@@ -361,13 +431,64 @@ async fn play_character(
     let mut announcements = server.announcements.subscribe();
     let mut admin_events = server.admin_events.subscribe();
     let mut alliance_events = server.alliance_events.subscribe();
+    let mut object_events = server.object_events.subscribe();
     let id = character.id;
+    if character.stats.get("ended").copied() == Some(1.) {
+        let _ = send(
+            socket,
+            &ServerMessage::Error {
+                message: "Жизни этого человека закончились".into(),
+                fatal: false,
+            },
+        )
+        .await;
+        return Ok(true);
+    }
+    let mates: Vec<i64> = sqlx::query_scalar(
+        "SELECT id FROM characters WHERE account_id=(SELECT account_id FROM characters WHERE id=$1) AND id<>$1",
+    )
+    .bind(id)
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(store::database_error)?;
+    {
+        let simulation = server.simulation.lock().await;
+        if simulation.account_busy(&mates) {
+            drop(simulation);
+            let _ = send(
+                socket,
+                &ServerMessage::Error {
+                    message: "На этом аккаунте уже кто-то в игре".into(),
+                    fatal: false,
+                },
+            )
+            .await;
+            return Ok(true);
+        }
+        let bots: Vec<mortown_protocol::Actor> = mates
+            .iter()
+            .filter_map(|mate| simulation.actor(*mate).filter(|actor| actor.offline))
+            .collect();
+        drop(simulation);
+        for actor in &bots {
+            store::save(conn, actor).await?;
+        }
+        server.simulation.lock().await.retire_offline(&mates);
+    }
     let actor = {
         let mut simulation = server.simulation.lock().await;
         simulation.join(id, character.nickname.clone(), pos, yaw)?;
         // Restore membership only after the actor has its saved stats, before the next tick.
-        simulation.configure(&character)
+        let mut actor = simulation.configure(&character);
+        if let Ok((presented, hidden)) = society::presentation(conn, id).await {
+            actor.presented = presented;
+            actor.face_hidden = hidden;
+        }
+        actor.identity = character.stats.get("identity").copied().unwrap_or(1.);
+        simulation.replace_actor(actor.clone());
+        actor
     };
+    let mut known = society::notes(conn, id).await.unwrap_or_default();
     let mut saved_kills = actor.progress.kills;
     let welcome = ServerMessage::Welcome {
         version: PROTOCOL_VERSION,
@@ -375,6 +496,7 @@ async fn play_character(
         character,
         actor,
     };
+    let mut hearing = server.hearing.subscribe();
     let mut snapshots = server.snapshots.clone();
     snapshots.borrow_and_update(); // Ignore snapshots from before this actor joined.
     let mut shutdown = server.shutdown.clone();
@@ -387,12 +509,13 @@ async fn play_character(
     save_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut budget_start = Instant::now();
     let mut received = 0;
-    let mut mail_received = 0;
+    let mut exchange_received = 0;
+    let mut object_received = 0;
     let mut chat_received = 0;
-    let mut last_unread = None;
     let mut return_to_selection = false;
     let mut uncertain_inventory = false;
     if send(socket, &welcome).await.is_ok()
+        && send_objects(socket, server, conn, id).await.is_ok()
         && send(
             socket,
             &ServerMessage::Chat {
@@ -416,14 +539,15 @@ async fn play_character(
                     let update=store::load(conn,access.account,id).await.map(|(mut character,_,_)|{
                         let actor=simulation.actor(id).unwrap();
                         actor.progress.write_stats(&mut character.stats);
-                        character.loot=actor.loot.clone();
-                        mortown_protocol::items::include_loot(&mut character.inventory,&character.loot);
                         ServerMessage::EconomyUpdated{character,actor}
                     });
                     snapshots.borrow_and_update();
                     drop(simulation);
                     match update {Ok(reply)=>{if send(socket,&reply).await.is_err(){break;}},Err(e)=>{error(socket,e).await;break;}}
 
+                },
+                _ = object_events.changed() => {
+                    if send_objects(socket,server,conn,id).await.is_err(){break;}
                 },
                 _ = alliance_events.changed() => {
                     let actors=server.simulation.lock().await.snapshot();
@@ -445,6 +569,14 @@ async fn play_character(
                         _=>{},
                     }
                 },
+                heard = hearing.recv() => {
+                    if let Ok((recipients, speaker, label)) = heard
+                        && recipients.contains(&id)
+                        && send(socket, &ServerMessage::Hearing { speaker, label }).await.is_err()
+                    {
+                        break;
+                    }
+                },
                 _ = exchange_tick.tick() => {
                     let mut simulation=server.simulation.lock().await;
                     let actors=simulation.snapshot();
@@ -460,33 +592,39 @@ async fn play_character(
                     }
                 },
                 _ = save_tick.tick() => {
-                    let mut simulation = server.simulation.lock().await;
+                    let simulation = server.simulation.lock().await;
                     let actor = simulation.actor(id).unwrap();
-                    match mail::settle(conn, actor).await {
-                        Ok(actor) => {
-                            saved_kills = actor.progress.kills;
-                            simulation.replace_actor(actor);
-                            snapshots.borrow_and_update();
-                        }
-                        Err(e) => { drop(simulation); error(socket,e).await; break; }
-                    }
+                    if let Err(e) = store::save(conn, &actor).await { drop(simulation); error(socket,e).await; break; }
+                    saved_kills = actor.progress.kills;
                     drop(simulation);
+                    if send_objects(socket,server,conn,id).await.is_err(){break;}
                     let actors=server.simulation.lock().await.snapshot();
                     match alliance::view(conn,id,&actors).await {
                         Ok(reply)=>{if send(socket,&ServerMessage::Alliance{reply}).await.is_err(){break;}},
                         Err(message)=>{error(socket,message).await;break;}
                     }
-                    if let Ok(count) = mail::unread(conn, id).await && last_unread != Some(count) {
-                        last_unread = Some(count);
-                        if send(socket, &ServerMessage::Mail { reply: mortown_protocol::mail::Reply::Unread { count } }).await.is_err() { break; }
-                    }
                 }
                 changed = snapshots.changed() => {
                     if changed.is_err() { break; }
                     let mut snapshot = snapshots.borrow_and_update().clone();
-                    let simulation=server.simulation.lock().await;
+                    let mut simulation=server.simulation.lock().await;
                     // Cross-player exchange may have updated this actor after snapshot generation.
-                    let current=simulation.actor(id).unwrap();
+                    let mut current=simulation.actor(id).unwrap();
+                    let grants=simulation.take_grants(id);
+                    if !grants.is_empty() {
+                        simulation.exchanges.cancel(id,"Обмен отменён: в рюкзак поступила добыча");
+                        match objects::grant(conn,&mut current,&grants).await {
+                            Ok((character,ground))=>{
+                                simulation.replace_actor(current.clone());
+                                simulation.refresh_character(&character);
+                                saved_kills=current.progress.kills;
+                                if ground {server.object_events.send_replace(());}
+                                if send(socket,&ServerMessage::EconomyUpdated{character,actor:current.clone()}).await.is_err(){drop(simulation);break;}
+                            }
+                            Err(store::ExchangeFailure::Rejected(e))=>{drop(simulation);error(socket,e).await;break;}
+                            Err(store::ExchangeFailure::Uncertain)=>{uncertain_inventory=true;drop(simulation);error(socket,"Не удалось подтвердить сохранение добычи. Войдите снова").await;break;}
+                        }
+                    }
                     if current.progress.kills != saved_kills {
                         if let Err(e)=store::save(conn,&current).await { drop(simulation); error(socket,e).await; break; }
                         saved_kills=current.progress.kills;
@@ -495,7 +633,15 @@ async fn play_character(
                         actors.retain(|a| a.id == id || !a.powers.invisible);
                         for actor in actors.iter_mut() {
                             if actor.id != id {
-                                actor.powers = Default::default();
+                                let note = known.get(&actor.id).and_then(|(identity, note)| {
+                                    (*identity == actor.identity).then_some(note.as_str())
+                                });
+                                let label = mortown_protocol::society::public_label(
+                                    &actor.presented,
+                                    actor.face_hidden,
+                                    note,
+                                );
+                                mortown_protocol::conceal(actor, label);
                             }
                         }
                         if let Some(actor)=actors.iter_mut().find(|a|a.id==id){*actor=current;}
@@ -506,7 +652,7 @@ async fn play_character(
                 incoming = socket.recv() => {
                     let Some(Ok(message)) = incoming else { break; };
                     last_received=Instant::now();
-                    if budget_start.elapsed() >= Duration::from_secs(1) { budget_start=Instant::now(); received=0; mail_received=0; chat_received=0; }
+                    if budget_start.elapsed() >= Duration::from_secs(1) { budget_start=Instant::now(); received=0; exchange_received=0; object_received=0; chat_received=0; }
                     received+=1; if received > 100 { error(socket,"Слишком много команд").await; break; }
                     match message {
                         Message::Text(text) => match serde_json::from_str::<ClientMessage>(&text) {
@@ -515,7 +661,7 @@ async fn play_character(
                                 let mut simulation=server.simulation.lock().await;
                                 let refresh=matches!(command,mortown_protocol::alliance::Command::Refresh);
                                 let result=if chat_received>4 {Err("Слишком много действий с альянсом".into())} else {
-                                    if matches!(command,mortown_protocol::alliance::Command::Create{..} | mortown_protocol::alliance::Command::Deposit{..} | mortown_protocol::alliance::Command::Withdraw{..}) {
+                                    if matches!(command,mortown_protocol::alliance::Command::Create{..}) {
                                         simulation.exchanges.cancel(id,"Обмен отменён: операция с альянсом меняет инвентарь");
                                     }
                                     let actor=simulation.actor(id).unwrap();
@@ -562,39 +708,176 @@ async fn play_character(
                                     if send(socket,&ServerMessage::Party{reply}).await.is_err(){break;}
                                 }else{sim.parties.handle(id,&actors,command);}
                             }
+                            Ok(ClientMessage::Society { command }) => {
+                                chat_received += 1;
+                                if chat_received > 4 {
+                                    error(socket, "Слишком много действий").await;
+                                    break;
+                                }
+                                let actor = server.simulation.lock().await.actor(id).unwrap();
+                                match society::apply(conn, &actor, command).await {
+                                    Ok(message) => {
+                                        if let Ok((presented, hidden)) = society::presentation(conn, id).await {
+                                            let mut actor = server.simulation.lock().await.actor(id).unwrap();
+                                            actor.presented = presented;
+                                            actor.face_hidden = hidden;
+                                            server.simulation.lock().await.replace_actor(actor);
+                                        }
+                                        if let Ok(notes) = society::notes(conn, id).await {
+                                            known = notes;
+                                        }
+                                        if send(socket, &ServerMessage::Chat { reply: mortown_protocol::chat::Reply::Status { message } }).await.is_err() { break; }
+                                    }
+                                    Err(message) => {
+                                        if send(socket, &ServerMessage::Chat { reply: mortown_protocol::chat::Reply::Status { message } }).await.is_err() { break; }
+                                    }
+                                }
+                            }
+                            Ok(ClientMessage::Voice { speaking }) => {
+                                if !speaking { continue; }
+                                let (listeners, label) = {
+                                    let sim = server.simulation.lock().await;
+                                    let Some(actor) = sim.actor(id) else { continue; };
+                                    let world = sim.terrain();
+                                    let from = [actor.position[0], actor.position[2]];
+                                    let label = mortown_protocol::society::public_label(&actor.presented, actor.face_hidden, None);
+                                    let listeners = sim.snapshot().into_iter().filter(|other| {
+                                        let at = [other.position[0], other.position[2]];
+                                        other.id != id && mortown_protocol::society::in_earshot(from, at, world.segment_clear(from, at))
+                                    }).map(|other| other.id).collect();
+                                    (listeners, label)
+                                };
+                                let _ = server.hearing.send((listeners, id, label));
+                            }
                             Ok(ClientMessage::Chat{command})=>{
                                 chat_received+=1;
                                 let reply=if chat_received>4 {Some(mortown_protocol::chat::Reply::Status{message:"Слишком много действий в чате".into()})} else {chat::handle(server,conn,id,&mut chat_state,command).await};
+                                // A refused console command drops its transaction, which only queues the
+                                // ROLLBACK; run it now so its row locks do not outlive the command.
+                                if sqlx::Connection::ping(&mut *conn).await.is_err(){error(socket,"База данных недоступна").await;break;}
                                 if matches!(reply,Some(mortown_protocol::chat::Reply::Logout)){break;}
                                 if let Some(reply)=reply && send(socket,&ServerMessage::Chat{reply}).await.is_err(){break;}
                                 if send(socket,&ServerMessage::Chat{reply:chat_state.preferences()}).await.is_err(){break;}
                             }
                             Ok(ClientMessage::Exchange { command }) => {
-                                mail_received+=1;
-                                if mail_received>8 { error(socket,"Слишком много запросов обмена").await; break; }
+                                exchange_received+=1;
+                                if exchange_received>8 { error(socket,"Слишком много запросов обмена").await; break; }
                                 let mut simulation=server.simulation.lock().await;
                                 exchange::handle(&mut simulation,conn,id,command).await;
                             }
-                            Ok(ClientMessage::Mail { command }) => {
-                                mail_received += 1;
-                                let reply = if mail_received > 8 {
-                                    mortown_protocol::mail::Reply::Error { message: "Слишком много почтовых действий. Подождите секунду".into() }
-                                } else if command.changes_inventory() {
-                                    let mut simulation=server.simulation.lock().await;
-                                    simulation.exchanges.cancel(id,"Обмен отменён: инвентарь изменяется через почту");
-                                    let actor=simulation.actor(id).unwrap();
-                                    let reply=mail::handle(conn,id,command,Some(actor)).await;
-                                    if let Some(update)=reply.inventory_update() {
-                                        simulation.replace_actor(update.actor.clone());
-                                        simulation.refresh_character(&update.character);
-                                        saved_kills=update.actor.progress.kills;
-                                        snapshots.borrow_and_update();
-                                    }
-                                    reply
-                                } else {
-                                    mail::handle(conn, id, command, None).await
+                            Ok(ClientMessage::Cast { command }) => {
+                                object_received += 1;
+                                if object_received > 8 {
+                                    error(socket, "Слишком много действий с вещами").await;
+                                    break;
+                                }
+                                let (actor, terrain) = {
+                                    let simulation = server.simulation.lock().await;
+                                    let Some(actor) = simulation.actor(id) else {
+                                        drop(simulation);
+                                        error(socket, "Персонаж не в мире").await;
+                                        break;
+                                    };
+                                    (actor, simulation.terrain())
                                 };
-                                if send(socket, &ServerMessage::Mail { reply }).await.is_err() { break; }
+                                match crate::casting::handle(conn, &terrain, actor, command).await {
+                                    Ok(view) => {
+                                        if let Some(update) = &view.update {
+                                            let mut simulation = server.simulation.lock().await;
+                                            simulation.replace_actor(update.actor.clone());
+                                            simulation.refresh_character(&update.character);
+                                            saved_kills = update.actor.progress.kills;
+                                            snapshots.borrow_and_update();
+                                        }
+                                        if send(socket, &ServerMessage::Cast { view }).await.is_err() {
+                                            break;
+                                        }
+                                    }
+                                    Err(store::ExchangeFailure::Rejected(message)) => {
+                                        if send(
+                                            socket,
+                                            &ServerMessage::Error {
+                                                message,
+                                                fatal: false,
+                                            },
+                                        )
+                                        .await
+                                        .is_err()
+                                        {
+                                            break;
+                                        }
+                                    }
+                                    Err(store::ExchangeFailure::Uncertain) => {
+                                        uncertain_inventory = true;
+                                        error(socket, "Не удалось подтвердить литьё. Войдите снова").await;
+                                        break;
+                                    }
+                                }
+                            }
+                            Ok(ClientMessage::Work { command }) => {
+                                object_received += 1;
+                                if object_received > 8 { error(socket, "Слишком много действий с вещами").await; break; }
+                                let mut simulation = server.simulation.lock().await;
+                                simulation.exchanges.cancel(id, "Обмен отменён: вещи перемещаются");
+                                let actor = simulation.actor(id).unwrap();
+                                let terrain = simulation.terrain();
+                                let reply = match work::apply(conn, &terrain, actor, command).await {
+                                    Ok(outcome) => {
+                                        let update = outcome.update.map(|(character, actor)| {
+                                            simulation.replace_actor(actor.clone());
+                                            simulation.refresh_character(&character);
+                                            saved_kills = actor.progress.kills;
+                                            snapshots.borrow_and_update();
+                                            Box::new(mortown_protocol::transfer::InventoryUpdate { character, actor })
+                                        });
+                                        if outcome.changed {
+                                            if let Ok(blocks) = build::all(conn).await {
+                                                simulation.set_blocks(blocks);
+                                            }
+                                            server.object_events.send_replace(());
+                                        }
+                                        mortown_protocol::objects::Reply { view: outcome.view, message: outcome.message, update }
+                                    }
+                                    Err(store::ExchangeFailure::Rejected(message)) => mortown_protocol::objects::Reply { view: None, message, update: None },
+                                    Err(store::ExchangeFailure::Uncertain) => {
+                                        uncertain_inventory = true;
+                                        drop(simulation);
+                                        error(socket, "Не удалось подтвердить работу. Войдите снова").await;
+                                        break;
+                                    }
+                                };
+                                drop(simulation);
+                                if send(socket, &ServerMessage::Object { reply }).await.is_err() { break; }
+                            }
+                            Ok(ClientMessage::Objects { command }) => {
+                                object_received+=1;
+                                if object_received>8 { error(socket,"Слишком много действий с вещами").await; break; }
+                                let mut simulation=server.simulation.lock().await;
+                                simulation.exchanges.cancel(id,"Обмен отменён: вещи перемещаются");
+                                let actor=simulation.actor(id).unwrap();
+                                let terrain=simulation.terrain();
+                                let reply=match objects::apply(conn,&terrain,actor,command).await {
+                                    Ok(outcome)=>{
+                                        let update=outcome.update.map(|(character,actor)|{
+                                            simulation.replace_actor(actor.clone());
+                                            simulation.refresh_character(&character);
+                                            saved_kills=actor.progress.kills;
+                                            snapshots.borrow_and_update();
+                                            Box::new(mortown_protocol::transfer::InventoryUpdate{character,actor})
+                                        });
+                                        if outcome.changed {server.object_events.send_replace(());}
+                                        mortown_protocol::objects::Reply{view:outcome.view,message:outcome.message,update}
+                                    }
+                                    Err(store::ExchangeFailure::Rejected(message))=>mortown_protocol::objects::Reply{view:None,message,update:None},
+                                    Err(store::ExchangeFailure::Uncertain)=>{
+                                        uncertain_inventory=true;
+                                        drop(simulation);
+                                        error(socket,"Не удалось подтвердить перемещение вещей. Войдите снова, чтобы загрузить сохранённое состояние").await;
+                                        break;
+                                    }
+                                };
+                                drop(simulation);
+                                if send(socket,&ServerMessage::Object{reply}).await.is_err(){break;}
                             }
                             Ok(ClientMessage::Move { seq,target,walking }) => {
                                 let result = server.simulation.lock().await.input(id,seq,target,walking);
@@ -610,23 +893,30 @@ async fn play_character(
                                 let mut simulation=server.simulation.lock().await;
                                 simulation.exchanges.cancel(id,"Обмен отменён: экипировка изменяется");
                                 let actor = simulation.actor(id).unwrap();
-                                if let Err(e) = store::save(conn, &actor).await { drop(simulation); error(socket,e).await; break; }
-                                let reply=match store::set_equipment(conn,id,item,equipped).await {
-                                    Ok(character)=>{simulation.refresh_character(&character);ServerMessage::CharacterUpdated {character}},
-                                    Err(message)=>ServerMessage::Error {message,fatal:false},
+                                let reply=match store::set_equipment(conn,actor,item,equipped).await {
+                                    Ok((character,actor))=>{
+                                        simulation.replace_actor(actor);
+                                        simulation.refresh_character(&character);
+                                        snapshots.borrow_and_update();
+                                        ServerMessage::CharacterUpdated {character}
+                                    },
+                                    Err(store::ExchangeFailure::Rejected(message))=>ServerMessage::Error {message,fatal:false},
+                                    Err(store::ExchangeFailure::Uncertain)=>{
+                                        uncertain_inventory=true;
+                                        drop(simulation);
+                                        error(socket,"Не удалось подтвердить сохранение экипировки. Войдите снова").await;
+                                        break;
+                                    }
                                 };
                                 drop(simulation);
                                 if send(socket,&reply).await.is_err(){break;}
                             }
-                            Ok(command @ (ClientMessage::Specialize { .. } | ClientMessage::Craft { .. } | ClientMessage::Trade { .. } | ClientMessage::UsePotion | ClientMessage::Quest { .. } | ClientMessage::LearnSkill { .. } | ClientMessage::LearnSecondary | ClientMessage::LearnAbility { .. } | ClientMessage::SpendAttribute { .. } | ClientMessage::BindHotbar { .. } | ClientMessage::Arrange { .. })) => {
-                                let action = match command { ClientMessage::LearnAbility { skill } => economy::Action::LearnAbility { skill }, ClientMessage::Specialize { profession, expected } => economy::Action::Specialize { profession, expected }, ClientMessage::Craft { recipe, expected, specialization_revision } => economy::Action::Craft { recipe, expected, specialization_revision }, ClientMessage::Arrange { source, target, expected } => economy::Action::Arrange { source,target,expected }, ClientMessage::BindHotbar { slot, binding } => economy::Action::BindHotbar { slot, binding }, ClientMessage::Trade { npc, item, buy, sale } => economy::Action::Trade { npc, item, buy, sale }, ClientMessage::Quest { quest, complete } => economy::Action::Quest { quest, complete }, ClientMessage::LearnSkill { rank } => economy::Action::LearnSkill { rank }, ClientMessage::LearnSecondary => economy::Action::LearnSecondary, ClientMessage::SpendAttribute { stat, expected } => economy::Action::SpendAttribute { stat, expected }, _ => economy::Action::Potion };
+                            Ok(command @ (ClientMessage::Craft { .. } | ClientMessage::UsePotion | ClientMessage::SpendTalent { .. } | ClientMessage::SpendAttribute { .. } | ClientMessage::BindHotbar { .. } | ClientMessage::Arrange { .. })) => {
+                                let action = match command { ClientMessage::SpendTalent { talent, expected } => economy::Action::SpendTalent { talent, expected }, ClientMessage::Craft { recipe, expected } => economy::Action::Craft { recipe, expected }, ClientMessage::Arrange { source, target, expected } => economy::Action::Arrange { source,target,expected }, ClientMessage::BindHotbar { slot, binding } => economy::Action::BindHotbar { slot, binding }, ClientMessage::SpendAttribute { stat, expected } => economy::Action::SpendAttribute { stat, expected }, _ => economy::Action::Potion };
                                 let mut simulation = server.simulation.lock().await;
                                 simulation.exchanges.cancel(id,"Обмен отменён: инвентарь или характеристики изменяются");
                                 let actor = simulation.actor(id).unwrap();
-                                let world = simulation.terrain();
-                                let resident=if let economy::Action::Trade{npc,..}=&action{simulation.resident(*npc)}else{None};
-                                let invalid=(matches!(&action,economy::Action::Trade{..}) && resident.is_none()) || (matches!(&action,economy::Action::Quest{..}) && simulation.resident(mortown_world::npcs::PLAZA_TRADER).is_none());
-                                let result=if invalid{Err(store::ExchangeFailure::Rejected("NPC недоступен".into()))}else{store::exchange_at(conn, actor, action, &world,resident).await};
+                                let result=store::exchange(conn, actor, action).await;
                                 let reply = match result {
                                     Ok((character, actor)) => {
                                         simulation.replace_actor(actor.clone());
@@ -662,6 +952,16 @@ async fn play_character(
                                 let result = server.simulation.lock().await.use_ability(id, skill, target);
                                 if let Err(message) = result && send(socket, &ServerMessage::Error { message: message.into(), fatal: false }).await.is_err() { break; }
                             }
+                            Ok(ClientMessage::OfflineOrders { returns, guards, works }) => {
+                                let actor = {
+                                    let mut simulation = server.simulation.lock().await;
+                                    let Some(mut actor) = simulation.actor(id) else { break };
+                                    actor.orders = mortown_protocol::life::Orders { returns, guards, works };
+                                    simulation.replace_actor(actor.clone());
+                                    actor
+                                };
+                                if let Err(message) = store::save(conn, &actor).await && send(socket, &ServerMessage::Error { message, fatal: false }).await.is_err() { break; }
+                            }
                             Ok(ClientMessage::Respawn) => {
                                 let result=server.simulation.lock().await.respawn(id);
                                 if let Err(message)=result && send(socket,&ServerMessage::Error{message:message.into(),fatal:false}).await.is_err(){break;}
@@ -681,13 +981,31 @@ async fn play_character(
     // Remove only after persistence, so reconnect never races a stale save.
     let mut simulation = server.simulation.lock().await;
     simulation.exchanges.leave(id);
-    let actor = simulation.actor(id).unwrap();
+    let mut actor = simulation.actor(id).unwrap();
+    let grants = simulation.take_grants(id);
     let saved = if uncertain_inventory {
         Err("Соединение завершено без повторной записи инвентаря и баланса; состояние будет загружено из базы при входе".into())
+    } else if !grants.is_empty() {
+        match objects::grant(conn, &mut actor, &grants).await {
+            Ok((_, ground)) => {
+                if ground {
+                    server.object_events.send_replace(());
+                }
+                Ok(())
+            }
+            Err(store::ExchangeFailure::Rejected(e)) => Err(e),
+            Err(store::ExchangeFailure::Uncertain) => {
+                Err("Не удалось подтвердить сохранение добычи; состояние будет загружено из базы при входе".into())
+            }
+        }
     } else {
         store::save(conn, &actor).await
     };
-    simulation.leave(id);
+    if actor.lives == 0 {
+        simulation.leave(id);
+    } else {
+        simulation.disconnect(id);
+    }
     drop(simulation);
     saved?;
     if !return_to_selection {
@@ -695,4 +1013,42 @@ async fn play_character(
         let _ = send_frame(socket, Message::Close(None)).await;
     }
     Ok(return_to_selection)
+}
+async fn send_objects(
+    socket: &mut WebSocket,
+    server: &Server,
+    conn: &mut sqlx::PgConnection,
+    id: i64,
+) -> Result<(), ()> {
+    let Some(actor) = server.simulation.lock().await.actor(id) else {
+        return Ok(());
+    };
+    let at = [actor.position[0], actor.position[2]];
+    let Ok((mut containers, ground)) = objects::nearby(conn, at).await else {
+        return Ok(());
+    };
+    let castings = objects::casting_bodies(conn, &ground)
+        .await
+        .unwrap_or_default();
+    if work::offers(conn, &mut containers).await.is_err() {
+        return Ok(());
+    }
+    let Ok((nodes, plots)) = work::nearby(conn, at).await else {
+        return Ok(());
+    };
+    let Ok(blocks) = build::nearby(conn, at).await else {
+        return Ok(());
+    };
+    send(
+        socket,
+        &ServerMessage::Objects {
+            containers,
+            ground,
+            nodes,
+            plots,
+            blocks,
+            castings,
+        },
+    )
+    .await
 }

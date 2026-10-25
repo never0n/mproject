@@ -9,11 +9,12 @@ done
 
 echo 'Запускаем PostgreSQL…'
 if docker info >/dev/null 2>&1; then
-    docker compose up -d --wait db
+    compose() { docker compose "$@"; }
 else
     echo 'Для запуска Docker может потребоваться пароль администратора.'
-    sudo docker compose up -d --wait db
+    compose() { sudo docker compose "$@"; }
 fi
+compose up -d --wait db
 
 echo 'Проверяем сборку…'
 cargo build --workspace --locked
@@ -59,6 +60,21 @@ else
     response=''
 fi
 if [[ -z "$response" ]]; then
+    # The server applies new migrations on startup and they change saved characters irreversibly.
+    applied=$(compose exec -T db psql -U mortown -d mortown -tAc \
+        'SELECT count(*) FROM _sqlx_migrations WHERE success' 2>/dev/null || echo 0)
+    available=$(find crates/server/migrations -name '*.sql' | wc -l)
+    if (( applied < available )); then
+        backup=".local/backups/auto-$(date +%Y%m%d-%H%M%S).dump"
+        echo "Сервер обновит базу. Сохраняем копию: $backup"
+        mkdir -p .local/backups
+        if ! (umask 077; compose exec -T db pg_dump -U mortown -Fc mortown > "$backup") \
+            || [[ ! -s "$backup" ]]; then
+            rm -f "$backup"
+            echo 'Не удалось сохранить копию базы; сервер не запущен.' >&2
+            exit 1
+        fi
+    fi
     echo 'Запускаем сервер…'
     nohup env DATABASE_URL=postgres://mortown:mortown_local_dev@127.0.0.1:55432/mortown \
         MORTOWN_LISTEN=127.0.0.1:3000 ./target/debug/mortown-server \

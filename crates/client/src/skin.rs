@@ -1,6 +1,10 @@
 //! Shared native UI chrome. No image mockups: these are the actual interactive windows.
+//! `setup` runs once after all windows exist (after `movable::setup`) and restyles them in place:
+//! panel colours, rounded border, shadow, brass trim, a close button, and heading fonts.
+//! `close` handles every close button; `scale` sets the global `UiScale` from the window size.
 use crate::ui::{EDGE, GOLD, PANEL};
 use bevy::{prelude::*, ui::FocusPolicy, window::PrimaryWindow};
+/// The "×" button added to each overlay frame.
 #[derive(Component)]
 pub struct Close;
 /// Controls which render their own hover, focus or selection states.
@@ -15,6 +19,8 @@ fn shadow() -> BoxShadow {
         blur_radius: px(24),
     }])
 }
+/// `frames` = overlay windows (get trim and a close button); `plain` = trim only.
+/// The overlay list mirrors the one in `movable::setup`.
 pub fn setup(
     mut commands: Commands,
     overlays: Query<
@@ -23,15 +29,10 @@ pub fn setup(
             With<crate::ui::CharacterOverlay>,
             With<crate::inventory::InventoryOverlay>,
             With<crate::skills::Overlay>,
-            With<crate::journal::Overlay>,
-            With<crate::trade::TradeOverlay>,
             With<crate::crafting::Overlay>,
-            With<crate::dialogue::Overlay>,
             With<crate::alliance::Overlay>,
-            With<crate::warehouse::Overlay>,
         )>,
     >,
-    mail: Query<(&crate::mail::Section, &Children)>,
     exchange: Query<&Children, With<crate::exchange::Overlay>>,
     own_style: Query<
         Entity,
@@ -42,7 +43,6 @@ pub fn setup(
             With<crate::chat::Scroll>,
             With<crate::movable::Handle>,
             With<crate::actionbar::Slot>,
-            With<crate::journal::Tab>,
         )>,
     >,
     plain: Query<
@@ -73,20 +73,14 @@ pub fn setup(
     for entity in &own_style {
         commands.entity(entity).insert(OwnStyle);
     }
+    // Any text sized 20–32 px at startup is treated as a window title: serif, gold.
     for (mut font, mut color) in &mut fonts {
         if font.font_size >= 20. && font.font_size <= 32. {
             font.font = heading.clone();
             color.0 = GOLD;
         }
     }
-    let mut frames: Vec<_> = overlays.iter().filter_map(|c| c.first().copied()).collect();
-    for (s, c) in &mail {
-        if matches!(s, crate::mail::Section::Overlay)
-            && let Some(e) = c.first()
-        {
-            frames.push(*e);
-        }
-    }
+    let frames: Vec<_> = overlays.iter().filter_map(|c| c.first().copied()).collect();
     for entity in frames
         .iter()
         .copied()
@@ -103,6 +97,7 @@ pub fn setup(
                 *b = BorderColor::all(EDGE);
             }
         }
+        // Gold top line plus two corner squares; `FocusPolicy::Pass` keeps them click-through.
         commands.entity(entity).insert(shadow()).with_children(|p| {
             p.spawn((
                 Node {
@@ -167,12 +162,14 @@ pub fn setup(
             node.right = px(44);
         }
     }
+    // Drag strips stay invisible: hide the "⋮⋮⋮" label from `movable::setup`.
     for (parent, e) in &handle_texts {
         if handle_entities.contains(parent.parent()) {
             commands.entity(e).insert(Text::new(""));
         }
     }
 }
+/// Any "×" resets the whole `CharacterWindow`, closing every window at once.
 pub fn close(
     mut windows: ResMut<crate::ui::CharacterWindow>,
     mut crafting: ResMut<crate::crafting::Open>,
@@ -183,10 +180,12 @@ pub fn close(
         crafting.0 = false;
     }
 }
+/// UI is laid out for 1440×900; shrink or grow it to fit, within 0.75–1.15.
 pub fn scale(window: Single<&Window, With<PrimaryWindow>>, mut scale: ResMut<UiScale>) {
     let factor = (window.width() / 1440.)
         .min(window.height() / 900.)
         .clamp(0.75, 1.15);
+    // Write only on a real change: touching `UiScale` relayouts the whole UI.
     if (scale.0 - factor).abs() > 0.005 {
         scale.0 = factor;
     }

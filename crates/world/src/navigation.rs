@@ -1,8 +1,12 @@
 //! Bounded A* for click-to-move. Exact segment validation supplements the coarse grid.
+//! Runs on the client only (background task from `main.rs::click_destination`); the server
+//! validates each step of the resulting route through normal `Move` handling.
 use crate::{WORLD_HALF, World};
 use std::collections::{BinaryHeap, HashMap};
 
+/// Grid spacing in meters; cells are explored lazily, no grid is stored.
 const CELL: f32 = 2.0;
+/// Give up after this many expanded cells (keeps unreachable clicks from searching forever).
 const LIMIT: usize = 400_000;
 type Cell = (i32, i32);
 fn point(c: Cell) -> [f32; 2] {
@@ -11,6 +15,7 @@ fn point(c: Cell) -> [f32; 2] {
 fn cell(p: [f32; 2]) -> Cell {
     ((p[0] / CELL).round() as i32, (p[1] / CELL).round() as i32)
 }
+/// Octile distance in integer units: straight step = 10, diagonal ≈ 14 (≈ 10·√2).
 fn heuristic(a: Cell, b: Cell) -> i32 {
     let dx = (a.0 - b.0).abs();
     let dz = (a.1 - b.1).abs();
@@ -24,6 +29,8 @@ pub enum PathError {
     SearchLimit,
 }
 
+/// Route from `from` to `to` as `[x, z]` waypoints (excluding the start, ending at `to`).
+/// Tries a straight line first; otherwise A* on the grid, then removes unnecessary waypoints.
 pub fn find_path(world: &World, from: [f32; 2], to: [f32; 2]) -> Result<Vec<[f32; 2]>, PathError> {
     if !world.walkable(to[0], to[1]) {
         return Err(PathError::BlockedDestination);
@@ -31,6 +38,7 @@ pub fn find_path(world: &World, from: [f32; 2], to: [f32; 2]) -> Result<Vec<[f32
     if world.segment_clear(from, to) {
         return Ok(vec![to]);
     }
+    // Connect an off-grid point to the nearest grid cell (within ±2 cells) reachable in a straight line.
     let attach = |p| {
         let c = cell(p);
         let mut candidates: Vec<_> = (-2..=2)
@@ -47,6 +55,7 @@ pub fn find_path(world: &World, from: [f32; 2], to: [f32; 2]) -> Result<Vec<[f32
     };
     let start = attach(from).ok_or(PathError::NoRoute)?;
     let goal = attach(to).ok_or(PathError::NoRoute)?;
+    // `BinaryHeap` pops the largest item, so costs are stored negated to get the cheapest first.
     let mut open = BinaryHeap::new();
     let mut costs = HashMap::new();
     let mut parents = HashMap::new();
@@ -55,6 +64,7 @@ pub fn find_path(world: &World, from: [f32; 2], to: [f32; 2]) -> Result<Vec<[f32
     let mut expanded = 0;
     while let Some((_, negative_g, current)) = open.pop() {
         let g = -negative_g;
+        // Stale heap entry: a cheaper way to this cell was already found.
         if costs.get(&current).copied() != Some(g) {
             continue;
         }

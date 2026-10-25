@@ -1,4 +1,8 @@
+//! Party (group) wire types: commands from the leader/members and the current group view.
+//! Rules live in `server/src/party.rs`; UI in `client/src/party.rs`.
 use serde::{Deserialize, Serialize};
+/// Max members; kill rewards are shared among live members within `REWARD_RANGE` m of the enemy;
+/// a disconnected member keeps their place for `RECONNECT_SECONDS`.
 pub const LIMIT: usize = 5;
 pub const REWARD_RANGE: f32 = 60.;
 pub const RECONNECT_SECONDS: u32 = 180;

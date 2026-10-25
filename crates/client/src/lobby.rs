@@ -1,3 +1,8 @@
+//! Pre-game screen: login/registration, the hero roster, character creation and the
+//! rotating 3D model preview. Shown whenever `Network` is not playing.
+//! Flow per frame: `buttons` (clicks) → `typing` (keyboard) → `submit` (sends the request)
+//! → `display`/`layout`/`style` (texts, visibility, colours). Server answers arrive via
+//! `network::receive`, which switches `Network::mode` (Menu → Connecting → Selection → Online).
 use crate::{
     Movement, RunOptions,
     network::{Mode, Network},
@@ -7,21 +12,26 @@ use bevy::{
     prelude::*,
 };
 use mortown_protocol::{
-    CHARACTER_LIMIT, CLASSES, ClientMessage, PROTOCOL_VERSION, RACES, WORLD_VERSION,
-    starting_stats, validate_character, validate_credentials,
+    CHARACTER_LIMIT, ClientMessage, PROTOCOL_VERSION, WORLD_VERSION, starting_stats,
+    validate_character, validate_credentials,
 };
 
+/// Lobby form state (client-only; nothing here is sent until `submit`).
 #[derive(Resource)]
 pub struct Form {
+    /// Text fields: 0 login, 1 password, 2 new hero name.
     values: [String; 3],
+    /// Index into `values` that receives typed text.
     focus: usize,
     register: bool,
     creating: bool,
+    /// "Меню ▾" dropdown on the roster (new hero / log out).
     menu_open: bool,
-    race: u8,
-    class: u8,
+    /// Creation choice, 1-based like the protocol id. Every hero is a human without class.
     gender: u8,
+    /// Set by a click or Enter; consumed by `submit` later in the same frame.
     submit: bool,
+    /// Last seen `Network::selection_revision`; a new roster from the server resets the form.
     revision: u64,
 }
 impl Default for Form {
@@ -32,8 +42,6 @@ impl Default for Form {
             register: false,
             creating: false,
             menu_open: false,
-            race: 1,
-            class: 1,
             gender: 1,
             submit: false,
             revision: 0,
@@ -41,6 +49,9 @@ impl Default for Form {
     }
 }
 impl Form {
+    /// What the 3D preview should show: the hero being created, or the selected roster hero
+    /// with their equipment. `None` outside hero selection. Read by `appearance`, `ancestry`
+    /// and `inventory` (which turns the preview camera on).
     pub fn model_preview(
         &self,
         network: &Network,
@@ -54,7 +65,6 @@ impl Form {
         if self.creating {
             return Some((
                 mortown_protocol::BodyAppearance {
-                    race: self.race,
                     gender: self.gender,
                 },
                 default(),
@@ -67,44 +77,55 @@ impl Form {
             .map(|c| {
                 (
                     c.into(),
-                    mortown_protocol::items::EquipmentAppearance::from_inventory(&c.inventory),
+                    mortown_protocol::items::EquipmentAppearance::from_items(&c.items),
                 )
             })
     }
 }
+/// Full-screen dimmed root of the lobby.
 #[derive(Component)]
 pub struct Lobby;
+/// Main form panel (left).
 #[derive(Component)]
 pub struct Panel;
+/// "Внешность" side panel with the model image; hidden on narrow windows.
 #[derive(Component)]
 pub struct ModelPanel;
+/// Image that shows the preview camera's render target.
 #[derive(Component)]
 pub struct ModelImage;
+/// ◀/▶ button; rotation step in radians.
 #[derive(Component)]
 pub struct TurnModel(pub f32);
+/// Every lobby button. One enum drives clicks (`buttons`), labels (`display`) and sizes (`layout`).
 #[derive(Component, Clone, Copy)]
 pub(crate) enum Action {
+    /// Text field; index into `Form::values`.
     Field(usize),
+    /// Toggle login ↔ registration.
     Mode,
-    Race,
-    Class,
     Gender,
     Submit,
     Menu,
+    /// Roster slot, 0-based (the protocol's `Character::slot` is 1-based).
     Slot(usize),
     New,
     Enter,
     Back,
     Logout,
 }
+/// Text inside an `Action` button.
 #[derive(Component)]
 pub(crate) struct Label(Action);
+/// Status/error line (from `Network::status`).
 #[derive(Component)]
 pub(crate) struct Feedback;
+/// Starting stats summary during creation.
 #[derive(Component)]
 pub(crate) struct Preview;
 #[derive(Component)]
 pub(crate) struct Title;
+/// Button group; `display` shows only the groups for the current screen.
 #[derive(Component, Clone, Copy)]
 pub(crate) enum Section {
     Auth,
@@ -120,9 +141,11 @@ pub fn setup(
     options: Res<RunOptions>,
     mut network: ResMut<Network>,
 ) {
+    // `--view`: skip the lobby and walk the world offline.
     if !options.view.is_empty() {
         network.mode = Mode::Offline;
     }
+    // Dev shortcut: auto-login from MORTOWN_LOGIN / MORTOWN_PASSWORD (not in UI preview runs).
     if let (Ok(login), Ok(password)) = (
         std::env::var("MORTOWN_LOGIN"),
         std::env::var("MORTOWN_PASSWORD"),
@@ -153,6 +176,7 @@ pub fn setup(
                 ..default()
             },
             BackgroundColor(Color::srgba(0.015, 0.025, 0.04, 0.70)),
+            // Above window overlays (10), below the ⚙ menu (40).
             GlobalZIndex(20),
         ))
         .with_children(|root| {
@@ -171,6 +195,7 @@ pub fn setup(
                 BorderColor::all(crate::ui::GOLD),
             ))
             .with_children(|panel| {
+                // Size 32 → restyled as a heading by `skin::setup`.
                 panel.spawn((
                     Text::new("М О Р Т А У Н"),
                     TextFont {
@@ -189,6 +214,7 @@ pub fn setup(
                         ..default()
                     },
                 ));
+                // All screens are spawned once; `display` toggles them by mode.
                 for (section, actions) in [
                     (
                         Section::Auth,
@@ -209,8 +235,6 @@ pub fn setup(
                         Section::Creation,
                         vec![
                             Action::Field(2),
-                            Action::Race,
-                            Action::Class,
                             Action::Gender,
                             Action::Submit,
                             Action::Back,
@@ -324,6 +348,7 @@ pub fn setup(
                     ImageNode::default(),
                     Node {
                         width: percent(100),
+                        // Width/height 3:4, portrait framing.
                         aspect_ratio: Some(0.75),
                         ..default()
                     },
@@ -335,6 +360,7 @@ pub fn setup(
                         ..default()
                     })
                     .with_children(|row| {
+                        // ±0.45 rad ≈ 26° per click.
                         for (text, angle) in [("◀", -0.45), ("▶", 0.45)] {
                             row.spawn((
                                 TurnModel(angle),
@@ -364,6 +390,7 @@ pub fn setup(
             });
         });
 }
+/// Rotates only the preview model (`Wearer::Preview`), never the in-world hero.
 pub fn turn_model(
     buttons: Query<(&TurnModel, &Interaction), Changed<Interaction>>,
     mut roots: Query<(&crate::appearance::Wearer, &mut Transform)>,
@@ -382,6 +409,8 @@ pub fn turn_model(
         }
     }
 }
+/// Lobby clicks plus two global keys: Shift+F10 (back to hero selection while playing)
+/// and Escape (close the dropdown / creation / registration). First system in the Update chain.
 #[allow(clippy::type_complexity)]
 pub fn buttons(
     mut form: ResMut<Form>,
@@ -390,6 +419,7 @@ pub fn buttons(
     buttons: Query<(&Interaction, &Action), Changed<Interaction>>,
     mut keys: ResMut<ButtonInput<KeyCode>>,
 ) {
+    // After successful registration: back to login with the password field focused.
     if network.registered {
         form.register = false;
         form.focus = 1;
@@ -423,6 +453,7 @@ pub fn buttons(
         keys.clear_just_pressed(KeyCode::Escape);
         return;
     }
+    // Ignore clicks while a request is in flight, so nothing is sent twice.
     if network.pending || !matches!(network.mode, Mode::Menu | Mode::Selection) {
         return;
     }
@@ -438,8 +469,6 @@ pub fn buttons(
                 form.values[1].clear();
                 network.status.clear();
             }
-            Action::Race => form.race = form.race % 6 + 1,
-            Action::Class => form.class = form.class % 2 + 1,
             Action::Gender => form.gender = form.gender % 2 + 1,
             Action::Submit | Action::Enter => form.submit = true,
             Action::Menu => form.menu_open = !form.menu_open,
@@ -472,6 +501,7 @@ pub fn buttons(
         }
     }
 }
+/// Reads raw `KeyboardInput` (not `ButtonInput`) to get typed characters, including Cyrillic.
 pub fn typing(
     mut input: MessageReader<KeyboardInput>,
     mut form: ResMut<Form>,
@@ -484,6 +514,7 @@ pub fn typing(
         {
             continue;
         }
+        // On the roster, only Enter matters (enter the world with the selected hero).
         if network.mode == Mode::Selection && !form.creating {
             if form.menu_open {
                 continue;
@@ -513,6 +544,7 @@ pub fn typing(
                     } else {
                         2
                     };
+                    // Limits are in UTF-8 bytes (Cyrillic letters take 2): password 128, others 64.
                     for c in text.chars().filter(|c| !c.is_control()) {
                         if form.values[i].len() + c.len_utf8() <= if i == 1 { 128 } else { 64 } {
                             form.values[i].push(c);
@@ -523,6 +555,8 @@ pub fn typing(
         }
     }
 }
+/// Validates locally with the shared protocol rules (same checks the server runs),
+/// then sends CreateCharacter / SelectCharacter, or opens the connection with Login / Register.
 pub fn submit(mut form: ResMut<Form>, mut network: ResMut<Network>) {
     if !form.submit {
         return;
@@ -533,15 +567,12 @@ pub fn submit(mut form: ResMut<Form>, mut network: ResMut<Network>) {
     }
     if network.mode == Mode::Selection {
         if form.creating {
-            if let Err(e) = validate_character(&form.values[2], form.race, form.class, form.gender)
-            {
+            if let Err(e) = validate_character(&form.values[2], form.gender) {
                 network.status = e.into();
                 return;
             }
             network.request(ClientMessage::CreateCharacter {
                 nickname: form.values[2].clone(),
-                race: form.race,
-                class: form.class,
                 gender: form.gender,
             });
         } else if let Some(character_id) = network.selected {
@@ -557,6 +588,7 @@ pub fn submit(mut form: ResMut<Form>, mut network: ResMut<Network>) {
         return;
     }
     let login = form.values[0].clone();
+    // The password is moved out, so it is not kept in the form after sending.
     let password = std::mem::take(&mut form.values[1]);
     network.begin(if form.register {
         ClientMessage::Register {
@@ -574,6 +606,8 @@ pub fn submit(mut form: ResMut<Form>, mut network: ResMut<Network>) {
         }
     });
 }
+/// Rewrites every lobby text and picks which `Section`s are visible.
+/// The `Without<...>` filters keep the four `Single<&mut Text>` queries disjoint (Bevy B0001).
 #[allow(clippy::type_complexity, clippy::too_many_arguments)]
 pub fn display(
     form: Res<Form>,
@@ -646,6 +680,7 @@ pub fn display(
         && !network.pending
     {
         "Персонажей пока нет. Создайте первого через «Меню».".into()
+    // Default prompts set by `network.rs` duplicate the title, so they are hidden.
     } else if [
         "Войдите в аккаунт или зарегистрируйтесь",
         "Войдите в аккаунт",
@@ -676,8 +711,6 @@ pub fn display(
                 "Регистрация"
             }
             .into(),
-            Action::Race => format!("Раса: {}  ›", RACES[form.race as usize - 1]),
-            Action::Class => format!("Класс: {}  ›", CLASSES[form.class as usize - 1]),
             Action::Gender => format!(
                 "Пол: {}  ›",
                 if form.gender == 1 {
@@ -702,17 +735,20 @@ pub fn display(
                 .find(|c| c.slot as usize == slot + 1)
                 .map(|c| {
                     format!(
-                        "{} {} · ур. {:.0}\n{} · {} · {}",
+                        "{} {} · ур. {:.0}\n{}",
                         if network.selected == Some(c.id) {
                             "▸"
                         } else {
                             " "
                         },
                         c.nickname,
+                        // Panics if the server omits "level".
                         c.stats["level"],
-                        RACES[c.race as usize - 1],
-                        CLASSES[c.class as usize - 1],
-                        if c.gender == 1 { "М" } else { "Ж" }
+                        if c.gender == 1 {
+                            "Мужчина"
+                        } else {
+                            "Женщина"
+                        }
                     )
                 })
                 .unwrap_or_default(),
@@ -741,9 +777,9 @@ pub fn display(
         };
     }
     preview.0 = if network.mode == Mode::Selection && form.creating {
-        let s = starting_stats(form.race, form.class).unwrap();
+        let s = starting_stats().unwrap();
         format!(
-            "Здоровье {:.0} · Мана {:.0} · Выносливость {:.0}\nСИЛ {:.0} · ЛОВ {:.0} · ВЫН {:.0} · ИНТ {:.0} · МДР {:.0} · ДУХ {:.0} · УДЧ {:.0}\nВнешность пока общая для всех рас и обоих полов.",
+            "Здоровье {:.0} · Мана {:.0} · Выносливость {:.0}\nСИЛ {:.0} · ЛОВ {:.0} · ВЫН {:.0} · ИНТ {:.0} · МДР {:.0} · ДУХ {:.0} · УДЧ {:.0}\nВсе герои — люди без класса. Свободные очки ({:.0}) распределяются в окне C; путь определяют оружие и навыки.",
             s["hp"],
             s["mana"],
             s["stamina"],
@@ -753,13 +789,16 @@ pub fn display(
             s["INT_"],
             s["WIT"],
             s["MEN"],
-            s["LUC"]
+            s["LUC"],
+            s["stat_point"]
         )
     } else {
         String::new()
     };
 }
 
+/// Responsive sizes: hides the model panel below 840 UI px, widens the form on the roster,
+/// hides empty roster slots and empty status lines.
 #[allow(clippy::type_complexity)]
 pub fn layout(
     network: Res<Network>,
@@ -853,6 +892,7 @@ pub fn layout(
 }
 
 /// Keep keyboard focus visible independently of mouse hover.
+/// Lobby buttons are `skin::OwnStyle`, so `ui::button_feedback` leaves them alone.
 pub fn style(
     form: Res<Form>,
     network: Res<Network>,
@@ -934,12 +974,9 @@ mod tests {
                 id: 1,
                 slot: 1,
                 nickname: "Hero".into(),
-                race: 1,
-                class: 1,
                 gender: 1,
-                stats: starting_stats(1, 1).unwrap(),
-                inventory: vec![],
-                loot: Default::default(),
+                stats: starting_stats().unwrap(),
+                items: vec![],
             });
         app.update();
         assert_eq!(

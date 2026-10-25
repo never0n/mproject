@@ -27,18 +27,6 @@ pub async fn view(
             hp: a.map_or(0., |a| a.hp),
         });
     }
-    for n in &sim.residents {
-        entries.push(Entry {
-            target: Target::Npc(n.id),
-            name: mortown_world::npcs::definition(n.template)
-                .map_or("NPC", |n| n.name)
-                .into(),
-            role: 0,
-            level: 1,
-            position: Some(n.position),
-            hp: n.hp,
-        });
-    }
     for m in sim.monsters() {
         entries.push(Entry {
             target: Target::Mob(m.id),
@@ -149,11 +137,6 @@ async fn permitted(
 fn location(sim: &crate::simulation::Simulation, t: Target) -> Result<[f32; 3], String> {
     match t {
         Target::Player(id) => sim.actor(id).map(|a| a.position),
-        Target::Npc(id) => sim
-            .residents
-            .iter()
-            .find(|n| n.id == id)
-            .map(|n| n.position),
         Target::Mob(id) => sim
             .monsters()
             .iter()
@@ -197,7 +180,7 @@ pub async fn execute(
         return mode(server, conn, owner, name).await;
     }
     if name == "//resetworld" {
-        return Ok(confirmation(state,"Восстановление мира","Убрать созданных мобов и NPC и восстановить исходных жителей и противников? Персонажи и их вещи сохраняются.".into(),PendingAction::ResetWorld));
+        return Ok(confirmation(state,"Восстановление мира","Убрать созданных мобов и восстановить исходных противников? Персонажи и их вещи сохраняются.".into(),PendingAction::ResetWorld));
     }
     if name == "//role" {
         let player = id(call.args[0])?;
@@ -252,51 +235,25 @@ pub async fn execute(
         if !sim.terrain().walkable(a.position[0], a.position[2]) {
             return Err("Точка спавна недоступна".into());
         }
-        if (1..=3).contains(&template) {
-            if sim.combat.mobs.len() >= 128 {
-                return Err("Предел: 128 мобов".into());
-            }
-            audit(
-                conn,
-                owner,
-                name,
-                &template.to_string(),
-                &format!("{:?}", a.position),
-            )
-            .await?;
-            let kind = match template {
-                1 => mortown_protocol::monsters::Kind::Bandit,
-                2 => mortown_protocol::monsters::Kind::Marauder,
-                _ => mortown_protocol::monsters::Kind::Apostate,
-            };
-            let id = sim.combat.spawn_admin(kind, a.position)?;
-            return Ok(notice(format!("Создан моб #{id} на вашей позиции")));
+        let kind = match template {
+            1 => mortown_protocol::monsters::Kind::Bandit,
+            2 => mortown_protocol::monsters::Kind::Marauder,
+            3 => mortown_protocol::monsters::Kind::Apostate,
+            _ => return Err("Мобы: 1–3".into()),
+        };
+        if sim.combat.mobs.len() >= 128 {
+            return Err("Предел: 128 мобов".into());
         }
-        let template = u8::try_from(template.checked_sub(100).ok_or("Мобы: 1–3, NPC: 101–107")?)
-            .map_err(|_| "Мобы: 1–3, NPC: 101–107")?;
-        let n = mortown_world::npcs::definition(template).ok_or("NPC: 101–107")?;
-        let id =
-            u8::try_from(sim.next_npc).map_err(|_| "Исчерпаны ID NPC до перезапуска сервера")?;
         audit(
             conn,
             owner,
             name,
-            &(u16::from(template) + 100).to_string(),
+            &template.to_string(),
             &format!("{:?}", a.position),
         )
         .await?;
-        sim.next_npc += 1;
-        sim.residents.push(mortown_protocol::admin::NpcState {
-            id,
-            template,
-            position: a.position,
-            yaw: a.yaw,
-            hp: 100.,
-        });
-        return Ok(notice(format!(
-            "Создан NPC {} #{id} на вашей позиции",
-            n.name
-        )));
+        let id = sim.combat.spawn_admin(kind, a.position)?;
+        return Ok(notice(format!("Создан моб #{id} на вашей позиции")));
     }
     let selected = state
         .selected
@@ -307,7 +264,7 @@ pub async fn execute(
             state,
             "Удаление цели из мира",
             format!(
-                "Убрать {selected:?}? NPC/моб исчезнет до восстановления мира или перезапуска сервера. Игрок будет отключён; его персонаж останется в базе."
+                "Убрать {selected:?}? Моб исчезнет до восстановления мира или перезапуска сервера. Игрок будет отключён; его персонаж останется в базе."
             ),
             PendingAction::Remove(selected),
         ));
@@ -334,14 +291,6 @@ pub async fn execute(
     audit(conn, owner, name, &format!("{selected:?}"), "").await?;
     let kill = name == "//kill";
     match selected {
-        Target::Npc(id) => {
-            let n = sim
-                .residents
-                .iter_mut()
-                .find(|n| n.id == id)
-                .ok_or("NPC не найден")?;
-            n.hp = if kill { 0. } else { 100. };
-        }
         Target::Mob(id) => {
             let tick = sim.tick();
             if kill {
@@ -401,10 +350,8 @@ pub async fn remove(
         let mut sim = server.simulation.lock().await;
         location(&sim, target_id)?;
         audit(conn, owner, "//del", &format!("{target_id:?}"), "").await?;
-        match target_id {
-            Target::Npc(id) => sim.residents.retain(|n| n.id != id),
-            Target::Mob(id) => sim.combat.remove_admin(id)?,
-            _ => unreachable!(),
+        if let Target::Mob(id) = target_id {
+            sim.combat.remove_admin(id)?;
         }
     }
     Ok(notice("Цель убрана из мира"))
@@ -421,19 +368,9 @@ pub async fn reset(
     let world = sim.terrain();
     audit(conn, owner, "//resetworld", "мир", "").await?;
     sim.combat.reset_admin(&world);
-    sim.residents = mortown_world::npcs::RESIDENTS
-        .iter()
-        .map(|n| mortown_protocol::admin::NpcState {
-            id: n.id,
-            template: n.id,
-            position: n.feet(&world),
-            yaw: n.yaw(),
-            hp: 100.,
-        })
-        .collect();
     for mut a in sim.snapshot() {
         a.attack_target = None;
         sim.replace_actor(a);
     }
-    Ok(notice("Исходные NPC и мобы восстановлены"))
+    Ok(notice("Исходные мобы восстановлены"))
 }

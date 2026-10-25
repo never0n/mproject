@@ -76,7 +76,7 @@ pub async fn execute(
 
     if matches!(
         name,
-        "//give" | "//takeaway" | "//takeawayall" | "//learns" | "//unlearns"
+        "//give" | "//takeaway" | "//takeawayall" | "//learns" | "//unlearns" | "//bronze"
     ) {
         return inventory(server, conn, owner, call).await;
     }
@@ -245,7 +245,7 @@ pub(super) async fn inventory(
     let args = &call.args;
     let target_id = id(args[0])?;
     let name = call.spec.name;
-    // Same lock order as normal equipment/trade/mail operations: simulation, then DB.
+    // Same lock order as normal equipment/exchange operations: simulation, then DB.
     let mut sim = server.simulation.lock().await;
     let current = sim.actor(target_id);
     let mut tx = conn.begin().await.map_err(db)?;
@@ -265,8 +265,15 @@ pub(super) async fn inventory(
         .fetch_one(&mut *tx)
         .await
         .map_err(db)?;
-    let mut c = crate::store::character(&row)?;
-    c.stats = serde_json::from_value(row.get("stats")).map_err(|_| "Ошибка характеристик")?;
+    let mut c = mortown_protocol::Character {
+        id: target_id,
+        slot: row.get::<i16, _>("slot") as u8,
+        nickname: row.get("nickname"),
+        gender: row.get::<i16, _>("gender") as u8,
+        stats: serde_json::from_value(row.get("stats")).map_err(|_| "Ошибка характеристик")?,
+        items: crate::inventory::carried(&mut tx, target_id).await?,
+    };
+    let before = c.items.clone();
     let kind = if args.len() > 1 {
         Some(u8::try_from(number(args[1])?).map_err(|_| "ID вне каталога")?)
     } else {
@@ -275,8 +282,11 @@ pub(super) async fn inventory(
     if matches!(name, "//learns" | "//unlearns") {
         let skill = kind.unwrap();
         let learned = name == "//learns";
-        if skills::definition(c.class, c.race, skill).is_none() {
-            return Err("Навык недоступен для класса/расы или отсутствует в каталоге 1–7".into());
+        if !(1..=skills::LAST_SKILL).contains(&skill) {
+            return Err(format!(
+                "Навык отсутствует в каталоге 1–{}",
+                skills::LAST_SKILL
+            ));
         }
         match skill {
             1 => {
@@ -305,81 +315,23 @@ pub(super) async fn inventory(
             }
         }
     } else {
-        let kinds: Vec<u8> = if name == "//takeawayall" {
-            (1..=u8::MAX)
-                .filter(|k| items::definition(*k).is_some())
-                .collect()
+        let (kind, amount, giving) = if name == "//bronze" {
+            (items::BRONZE, Some(18u64), true)
         } else {
-            vec![kind.unwrap()]
+            let amount = args.get(2).map(|n| number(n)).transpose()?;
+            (kind.unwrap(), amount, name == "//give")
         };
-        let amount = args.get(2).map(|n| number(n)).transpose()?;
-        for kind in kinds {
+        if name == "//takeawayall" {
+            c.items.clear();
+        } else {
             let def = items::definition(kind).ok_or("Предмет не найден в текущем каталоге")?;
-            let old = layout::quantity(&c, kind);
-            let next = if name == "//give" {
-                let amount = amount.ok_or("Количество обязательно")?;
-                let count = u64::from(old)
-                    .checked_add(amount)
-                    .ok_or("Слишком большое количество")?;
-                let cap = if items::equippable(kind) {
-                    65536
-                } else {
-                    1_000_000_000
-                };
-                if count > cap {
-                    return Err("Превышен предел количества вещей/валюты".into());
-                }
-                let cells: u64 = (1..=u8::MAX)
-                    .map(|k| {
-                        let n = layout::quantity(&c, k);
-                        if items::equippable(k) {
-                            u64::from(n)
-                        } else {
-                            u64::from(n > 0)
-                        }
-                    })
-                    .sum();
-                let extra = if items::equippable(kind) {
-                    amount
-                } else {
-                    u64::from(old == 0)
-                };
-                if cells + extra > 65536 {
-                    return Err("Освободите место в инвентаре".into());
-                }
-                count as u32
-            } else {
-                let remove = amount.unwrap_or(u64::from(old));
-                if remove > u64::from(old) {
-                    return Err(format!("Недостаточно предметов: {}", def.name));
-                }
-                old - remove as u32
-            };
-            if let Some(key) = items::currency(kind) {
-                c.stats.insert(key.into(), f64::from(next));
-            } else {
-                c.loot.insert(kind, next);
-                if let Some(item) = c.inventory.iter_mut().find(|i| i.kind == kind) {
-                    let copy = c
-                        .stats
-                        .get(&format!("gear_copy_{kind}"))
-                        .copied()
-                        .unwrap_or(0.) as u32;
-                    if copy >= next {
-                        item.equipped = false;
-                        c.stats.remove(&format!("gear_copy_{kind}"));
-                    }
-                }
-                items::include_loot(&mut c.inventory, &c.loot);
-            }
+            change_items(&mut c.items, kind, giving, amount)
+                .map_err(|e| format!("{}: {e}", def.name))?;
         }
         let invalid: Vec<_> = c
             .stats
             .iter()
-            .filter(|(k, v)| {
-                (k.starts_with("bag_") || k.starts_with("hotbar_"))
-                    && !layout::valid(&c, **v as u64)
-            })
+            .filter(|(k, v)| k.starts_with("hotbar_") && !layout::valid(&c, **v as u64))
             .map(|(k, _)| k.clone())
             .collect();
         for key in invalid {
@@ -391,11 +343,18 @@ pub(super) async fn inventory(
         .checked_add(1)
         .ok_or("Исчерпаны версии административных изменений")?;
     c.stats.insert("admin_revision".into(), f64::from(revision));
-    sqlx::query("UPDATE characters SET stats=$2,inventory=$3,loot=$4 WHERE id=$1")
+    crate::inventory::sync(
+        &mut tx,
+        &[crate::inventory::Change {
+            owner: Some(target_id),
+            before: &before,
+            after: &c.items,
+        }],
+    )
+    .await?;
+    sqlx::query("UPDATE characters SET stats=$2 WHERE id=$1")
         .bind(target_id)
         .bind(serde_json::to_value(&c.stats).unwrap())
-        .bind(serde_json::to_value(&c.inventory).unwrap())
-        .bind(serde_json::to_value(&c.loot).unwrap())
         .execute(&mut *tx)
         .await
         .map_err(db)?;
@@ -407,18 +366,12 @@ pub(super) async fn inventory(
         &args[1..].join(" "),
     )
     .await?;
-    let updated = sqlx::query("SELECT * FROM characters WHERE id=$1")
-        .bind(target_id)
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(db)?;
-    let updated = crate::store::character(&updated)?;
+    let updated = crate::store::sheet(&mut tx, target_id).await?;
     tx.commit().await.map_err(db)?;
     if let Some(mut actor) = current {
         sim.exchanges
             .cancel(target_id, "Обмен отменён: изменения администратором");
         actor.progress = Progress::from_stats(&c.stats);
-        actor.loot = c.loot;
         actor.actions.clear();
         sim.replace_actor(actor);
         sim.refresh_character(&updated);
@@ -427,6 +380,77 @@ pub(super) async fn inventory(
     Ok(notice(format!(
         "{name}: {nickname} (ID {target_id}) — выполнено"
     )))
+}
+/// Admin creation or removal of `amount` units of `kind` on a character. Creation ignores the
+/// carry limit; coins of any denomination join the purse by value.
+fn change_items(
+    stacks: &mut Vec<items::Stack>,
+    kind: u8,
+    give: bool,
+    amount: Option<u64>,
+) -> Result<(), String> {
+    use mortown_protocol::transfer::{self, Holder};
+    if let Some(value) = items::coin_value(kind) {
+        let have = transfer::coins(stacks, Holder::Character);
+        let held = stacks
+            .iter()
+            .filter(|s| s.kind == kind && s.location == items::Location::Purse)
+            .map(|s| u64::from(s.quantity))
+            .sum::<u64>();
+        let units = if give {
+            amount.ok_or("Количество обязательно")?
+        } else {
+            amount.unwrap_or(held)
+        };
+        let delta = units
+            .checked_mul(value)
+            .ok_or("Слишком большое количество")?;
+        let total = if give {
+            have.checked_add(delta)
+                .filter(|t| *t <= 1_000_000_000 * 10_000)
+                .ok_or("Превышен предел монет")?
+        } else {
+            have.checked_sub(delta).ok_or("Недостаточно монет")?
+        };
+        return transfer::set_coins(stacks, Holder::Character, total).map_err(Into::into);
+    }
+    if give {
+        let amount = amount.ok_or("Количество обязательно")?;
+        if amount == 0 || amount > 10_000 {
+            return Err("Количество: от 1 до 10000".into());
+        }
+        let mut left = amount as u32;
+        while left > 0 {
+            let part = if items::stackable(kind) {
+                left.min(items::MAX_STACK)
+            } else {
+                1
+            };
+            transfer::put(
+                stacks,
+                Holder::Character,
+                items::Stack::new(kind, part, items::Location::Purse),
+            )?;
+            left -= part;
+        }
+        return Ok(());
+    }
+    let held: u64 = stacks
+        .iter()
+        .filter(|s| s.kind == kind && s.carried())
+        .map(|s| u64::from(s.quantity))
+        .sum();
+    let mut left = amount.unwrap_or(held);
+    if left > held {
+        return Err("Недостаточно предметов".into());
+    }
+    for s in stacks.iter_mut().filter(|s| s.kind == kind && s.carried()) {
+        let used = u64::from(s.quantity).min(left);
+        s.quantity -= used as u32;
+        left -= used;
+    }
+    stacks.retain(|s| s.quantity > 0);
+    Ok(())
 }
 pub async fn delete(
     server: &crate::Server,
@@ -464,9 +488,11 @@ pub async fn delete(
     if leader {
         return Err("Сначала передайте лидерство альянса".into());
     }
-    let escrow:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM character_mail WHERE (sender_id=$1 OR recipient_id=$1) AND attachment_kind IS NOT NULL AND NOT attachment_claimed AND NOT attachment_returned) OR EXISTS(SELECT 1 FROM mail_payments WHERE (owner_id=$1 OR mail_id IN (SELECT id FROM character_mail WHERE sender_id=$1 OR recipient_id=$1)) AND NOT settled)").bind(target_id).fetch_one(&mut *tx).await.map_err(db)?;
-    if escrow {
-        return Err("Сначала завершите почтовые вложения и расчёты персонажа".into());
+    if crate::legacy::character_owns(&mut tx, target_id)
+        .await
+        .map_err(db)?
+    {
+        return Err(crate::legacy::KEPT.into());
     }
     sqlx::query("DELETE FROM chat_reports WHERE reporter_id=$1 OR message_id IN (SELECT id FROM chat_messages WHERE sender_id=$1 OR recipient_id=$1)").bind(target_id).execute(&mut *tx).await.map_err(db)?;
     sqlx::query("DELETE FROM chat_messages WHERE sender_id=$1 OR recipient_id=$1")

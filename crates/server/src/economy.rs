@@ -1,20 +1,13 @@
-use mortown_protocol::{Actor, Character, items, quests};
+use mortown_protocol::{
+    Actor, Character,
+    items::{self, Location, Stack},
+    transfer::{self, Holder},
+};
 
 pub enum Action {
-    Trade {
-        npc: u8,
-        item: u8,
-        buy: bool,
-        sale: Option<mortown_protocol::trade::Sale>,
-    },
     Potion,
     Craft {
         recipe: u8,
-        expected: u32,
-        specialization_revision: u32,
-    },
-    Specialize {
-        profession: mortown_protocol::professions::Profession,
         expected: u32,
     },
     SpendAttribute {
@@ -30,40 +23,31 @@ pub enum Action {
         slot: u8,
         binding: u8,
     },
-    LearnSecondary,
-    LearnAbility {
-        skill: u8,
-    },
-    LearnSkill {
-        rank: u8,
-    },
-    Quest {
-        quest: u8,
-        complete: bool,
+    SpendTalent {
+        talent: String,
+        expected: u32,
     },
 }
 
-pub fn craft(
-    actor: &mut Actor,
-    item: u8,
-    stats: &std::collections::BTreeMap<String, f64>,
-) -> Result<(), &'static str> {
+/// Spends the ingredients from the bag and puts the result there; the recipe stays.
+pub fn craft(actor: &mut Actor, c: &mut Character, item: u8) -> Result<(), &'static str> {
     if actor.hp <= 0. {
         return Err("Сначала возродитесь");
     }
     let recipe = mortown_protocol::crafting::definition(item).ok_or("Неизвестный рецепт")?;
-    recipe.validate_with(&actor.loot, stats)?;
-    // Validate everything before spending any ingredient. The caller persists this atomically.
-    for (kind, count) in recipe.requirements(stats) {
-        *actor.loot.get_mut(&kind).unwrap() -= count;
+    recipe.validate(c)?;
+    // Work on a copy: a rejected step never leaves ingredients half spent.
+    let mut next = c.items.clone();
+    for &(kind, count) in recipe.ingredients {
+        transfer::consume(&mut next, kind, count)?;
     }
-    *actor.loot.entry(recipe.result).or_default() += 1;
-    if let Some(q) = quests::definition(quests::CRAFT_QUEST)
-        && q.status(&actor.progress) == quests::Status::Active
-        && matches!(q.objective, quests::Objective::Craft(kind) if kind == recipe.result)
-    {
-        actor.progress.quest_crafted = true;
-    }
+    transfer::put(
+        &mut next,
+        Holder::Character,
+        Stack::new(recipe.result, 1, Location::Bag { cell: 0 }),
+    )?;
+    transfer::check_carry(&c.items, &next)?;
+    c.items = next;
     actor.reward_status = format!(
         "Создано: {} ×1",
         items::definition(recipe.result).unwrap().name
@@ -71,206 +55,50 @@ pub fn craft(
     Ok(())
 }
 
-pub fn learn_ability(actor: &mut Actor, class: u8, race: u8, id: u8) -> Result<(), &'static str> {
-    let ability = mortown_protocol::skills::definition(class, race, id)
-        .ok_or("Навык недоступен персонажу")?;
-    if actor.hp <= 0. {
-        return Err("Сначала возродитесь");
-    }
-    if mortown_protocol::skills::learned(&actor.progress, id) {
-        return Err("Навык уже изучен");
-    }
-    if actor.progress.level < ability.level {
-        return Err("Недостаточный уровень персонажа");
-    }
-    if actor.progress.sp < ability.sp {
-        return Err("Недостаточно SP");
-    }
-    actor.progress.sp -= ability.sp;
-    actor.progress.extra_skills |= 1 << (id - 3);
-    actor.reward_status = format!("Изучено: {} · −{} SP", ability.skill.name, ability.sp);
-    Ok(())
-}
-
-pub fn learn_secondary(actor: &mut Actor) -> Result<(), &'static str> {
-    if actor.hp <= 0. {
-        return Err("Сначала возродитесь");
-    }
-    if actor.progress.secondary_learned {
-        return Err("Второй навык уже изучен");
-    }
-    if actor.progress.level < 3 {
-        return Err("Требуется третий уровень");
-    }
-    if actor.progress.sp < 7. {
-        return Err("Недостаточно SP: требуется 7");
-    }
-    actor.progress.sp -= 7.;
-    actor.progress.secondary_learned = true;
-    actor.reward_status = "Изучен второй навык [2] · −7 SP".into();
-    Ok(())
-}
-
-pub fn learn(actor: &mut Actor, target: u8) -> Result<(), &'static str> {
-    if actor.hp <= 0. {
-        return Err("Сначала возродитесь");
-    }
-    let (level, cost) =
-        mortown_protocol::skills::upgrade_cost(target).ok_or("Недопустимый ранг навыка")?;
-    if target != actor.progress.skill_rank + 1 {
-        return Err("Этот ранг уже изучен или предыдущий ещё недоступен");
-    }
-    if actor.progress.level < level {
-        return Err("Недостаточный уровень персонажа");
-    }
-    if actor.progress.sp < cost {
-        return Err("Недостаточно SP");
-    }
-    actor.progress.sp -= cost;
-    actor.progress.skill_rank = target;
-    actor.reward_status = format!("Навык улучшен до ранга {target} · −{cost:.0} SP");
-    Ok(())
-}
-
-pub fn quest(
+/// Spends one talent point. Practice never calls this: a talent only moves when a point is spent.
+pub fn spend_talent(
     actor: &mut Actor,
-    character: &mut Character,
-    id: u8,
-    complete: bool,
-    world: &mortown_world::World,
+    c: &mut Character,
+    talent: &str,
+    expected: u32,
 ) -> Result<(), &'static str> {
+    let key = mortown_protocol::progression::talent_key(talent).ok_or("Неизвестный талант")?;
+    let name = mortown_protocol::progression::TALENTS
+        .iter()
+        .find(|(id, _)| *id == talent)
+        .map(|(_, name)| *name)
+        .unwrap();
     if actor.hp <= 0. {
         return Err("Сначала возродитесь");
     }
-    if !mortown_world::npcs::definition(mortown_world::npcs::PLAZA_TRADER)
-        .unwrap()
-        .available(world, actor.position)
-    {
-        return Err("Подойдите к Марену у центральной площади");
+    if actor.progress.talent_points < 1. {
+        return Err("Нет свободных очков таланта");
     }
-    let q = quests::definition(id).ok_or("Неизвестное поручение")?;
-    if complete {
-        if !q.ready(&actor.progress, &actor.loot) {
-            return Err("Задание ещё не выполнено или награда уже получена");
-        }
-        // Work on a copy: failed delivery or a full reward stack must spend nothing.
-        let mut bag = character.clone();
-        bag.loot = actor.loot.clone();
-        actor.progress.write_stats(&mut bag.stats);
-        items::include_loot(&mut bag.inventory, &bag.loot);
-        if let quests::Objective::Supplies(materials) = q.objective {
-            for &(kind, quantity) in materials {
-                mortown_protocol::transfer::take(
-                    &mut bag,
-                    &mortown_protocol::mail::AttachmentRequest {
-                        token: mortown_protocol::layout::token(kind, 0),
-                        quantity,
-                        price: 0,
-                    },
-                )?;
-            }
-        }
-        for &(kind, count) in q.rewards {
-            mortown_protocol::transfer::give(&mut bag, kind, count)?;
-        }
-        actor.progress.quest_stage = q.active_stage() + 1;
-        actor.progress.coins += f64::from(q.coins);
-        actor.progress.sp += f64::from(q.sp);
-        actor.loot = bag.loot.clone();
-        *character = bag;
-        actor.reward_status = format!("{} выполнено: {}", q.title, q.reward_text());
-    } else {
-        if q.status(&actor.progress) != quests::Status::Available {
-            return Err("Задание недоступно, уже принято или выполнено");
-        }
-        actor.progress.quest_stage = q.active_stage();
-        if id == 1 {
-            actor.progress.quest_kills = 0;
-        }
-        if id == quests::CRAFT_QUEST {
-            actor.progress.quest_crafted = false;
-        }
-        actor.reward_status = format!("Принято поручение: {}", q.title);
+    let rank = c.stats.get(&key).copied().unwrap_or(0.) as u32;
+    if rank != expected {
+        return Err("Талант уже изменён; повторите выбор");
     }
+    c.stats.insert(key, f64::from(rank + 1));
+    actor.progress.talent_points -= 1.;
+    actor.progress.write_stats(&mut c.stats);
+    actor.reward_status = format!("{name} +1 · потрачено 1 очко таланта");
     Ok(())
 }
 
-pub fn apply(
-    actor: &mut Actor,
-    inventory: &[items::Item],
-    action: Option<(u8, u8, bool)>,
-    world: &mortown_world::World,
-) -> Result<(), &'static str> {
-    apply_at(actor, inventory, action, world, None)
-}
-pub fn apply_at(
-    actor: &mut Actor,
-    inventory: &[items::Item],
-    action: Option<(u8, u8, bool)>,
-    world: &mortown_world::World,
-    resident: Option<mortown_world::npcs::Npc>,
-) -> Result<(), &'static str> {
-    if actor.hp <= 0. {
-        return Err("Погибший персонаж не может торговать или пить зелья");
+pub fn potion(actor: &mut Actor, c: &mut Character) -> Result<(), &'static str> {
+    if actor.hp <= 0. && !actor.downed {
+        return Err("Погибший персонаж не может пить зелья");
     }
-    if let Some((npc, kind, buy)) = action {
-        // Old starter items predate explicit loot quantities; absence means one owned copy.
-        let owned = actor
-            .loot
-            .get(&kind)
-            .copied()
-            .unwrap_or_else(|| u32::from(kind < 4 && inventory.iter().any(|i| i.kind == kind)));
-        let trader = resident
-            .or_else(|| mortown_world::npcs::definition(npc).copied())
-            .ok_or("Неизвестный торговец")?;
-        if trader.role != mortown_world::npcs::Role::Merchant
-            || !trader.available(world, actor.position)
-        {
-            return Err("Подойдите к торговцу: лавка недоступна через стены или издалека");
-        }
-        if buy {
-            let price = items::purchase_price(kind, &actor.progress)
-                .ok_or("Торговец не продаёт этот предмет")?;
-            if actor.progress.coins < price as f64 {
-                return Err("Недостаточно монет");
-            }
-            let count = owned.checked_add(1).ok_or("Нет места в стопке")?;
-            actor.progress.coins -= price as f64;
-            actor.loot.insert(kind, count);
-            actor.reward_status = format!(
-                "Куплено: {} · −{price} монет",
-                items::definition(kind).unwrap().name
-            );
-        } else {
-            let price = items::sell_price(kind).ok_or("Этот предмет нельзя продать")?;
-            let count = owned;
-            if count == 0 {
-                return Err("У вас нет этого предмета");
-            }
-            if count == 1 && inventory.iter().any(|i| i.kind == kind && i.equipped) {
-                return Err("Сначала снимите надетый предмет");
-            }
-            actor.loot.insert(kind, count - 1);
-            actor.progress.coins += price as f64;
-            actor.reward_status = format!(
-                "Продано: {} ×1 · +{} монет",
-                items::definition(kind).unwrap().name,
-                price
-            );
-        }
-    } else {
-        let count = actor.loot.get(&8).copied().unwrap_or(0);
-        if count == 0 {
-            return Err("Нет зелий здоровья");
-        }
-        if actor.hp >= actor.max_hp {
-            return Err("Здоровье уже полное");
-        }
-        let healed = items::POTION_HEAL.min(actor.max_hp - actor.hp);
-        actor.hp += healed;
-        actor.loot.insert(8, count - 1);
-        actor.reward_status = format!("Зелье здоровья: +{healed:.0} HP");
+    if mortown_protocol::crafting::in_bag(c, items::POTION) == 0 {
+        return Err("Нет зелий здоровья");
     }
+    if actor.hp >= actor.max_hp {
+        return Err("Здоровье уже полное");
+    }
+    transfer::consume(&mut c.items, items::POTION, 1)?;
+    let healed = items::POTION_HEAL.min(actor.max_hp - actor.hp);
+    actor.hp += healed;
+    actor.reward_status = format!("Зелье здоровья: +{healed:.0} HP");
     Ok(())
 }
 
@@ -279,309 +107,122 @@ mod tests {
     use super::*;
     use crate::simulation::Simulation;
     use std::sync::Arc;
+    pub(crate) fn sheet(stacks: &[(u8, u32)]) -> Character {
+        Character {
+            id: 1,
+            slot: 1,
+            nickname: "Test".into(),
+            gender: 1,
+            stats: mortown_protocol::starting_stats().unwrap(),
+            items: stacks
+                .iter()
+                .enumerate()
+                .map(|(n, &(kind, quantity))| Stack {
+                    id: n as i64 + 1,
+                    ..Stack::new(kind, quantity, Location::Bag { cell: n as u16 })
+                })
+                .collect(),
+        }
+    }
     #[test]
     fn crafting_validates_all_inputs_before_spending_and_retains_recipe() {
-        use mortown_protocol::crafting::{CUIRASS_RECIPE, LEATHER};
+        use mortown_protocol::crafting::{CUIRASS_RECIPE, LEATHER, in_bag};
         let mut sim = Simulation::new(Arc::new(mortown_world::World::new()));
         let mut actor = sim
             .join(1, "Craft".into(), mortown_world::SPAWN, 0.)
             .unwrap();
-        for (hp, recipe, loot) in [
+        for (hp, recipe, stacks) in [
+            (100., CUIRASS_RECIPE, vec![(LEATHER, 12), (7, 8)]),
             (
                 100.,
                 CUIRASS_RECIPE,
-                [(CUIRASS_RECIPE, 0), (LEATHER, 12), (7, 8), (6, 0)],
+                vec![(CUIRASS_RECIPE, 1), (LEATHER, 12), (7, 3)],
             ),
             (
                 100.,
                 CUIRASS_RECIPE,
-                [(CUIRASS_RECIPE, 1), (LEATHER, 12), (7, 3), (6, 0)],
+                vec![(CUIRASS_RECIPE, 1), (LEATHER, 5), (7, 8)],
             ),
+            // Too heavy to carry the result.
             (
                 100.,
                 CUIRASS_RECIPE,
-                [(CUIRASS_RECIPE, 1), (LEATHER, 5), (7, 8), (6, 0)],
-            ),
-            (
-                100.,
-                CUIRASS_RECIPE,
-                [(CUIRASS_RECIPE, 1), (LEATHER, 12), (7, 8), (6, u32::MAX)],
+                vec![(CUIRASS_RECIPE, 1), (LEATHER, 12), (7, 8), (13, 160)],
             ),
             (
                 0.,
                 CUIRASS_RECIPE,
-                [(CUIRASS_RECIPE, 1), (LEATHER, 12), (7, 8), (6, 0)],
+                vec![(CUIRASS_RECIPE, 1), (LEATHER, 12), (7, 8)],
             ),
-            (
-                100.,
-                255,
-                [(CUIRASS_RECIPE, 1), (LEATHER, 12), (7, 8), (6, 0)],
-            ),
+            (100., 255, vec![(CUIRASS_RECIPE, 1), (LEATHER, 12), (7, 8)]),
         ] {
             actor.hp = hp;
-            actor.loot = loot.into();
-            let before = serde_json::to_value(&actor).unwrap();
-            assert!(craft(&mut actor, recipe, &Default::default()).is_err());
-            assert_eq!(serde_json::to_value(&actor).unwrap(), before);
+            let mut c = sheet(&stacks);
+            let before = (serde_json::to_value(&actor).unwrap(), c.clone());
+            assert!(craft(&mut actor, &mut c, recipe).is_err());
+            assert_eq!((serde_json::to_value(&actor).unwrap(), c), before);
         }
-        actor.loot = [(CUIRASS_RECIPE, 1), (LEATHER, 12), (7, 8)].into();
-        let coins = actor.progress.coins;
-        craft(&mut actor, CUIRASS_RECIPE, &Default::default()).unwrap();
-        craft(&mut actor, CUIRASS_RECIPE, &Default::default()).unwrap();
-        assert_eq!(actor.loot[&CUIRASS_RECIPE], 1);
-        assert_eq!(actor.loot[&LEATHER], 0);
-        assert_eq!(actor.loot[&7], 0);
-        assert_eq!(actor.loot[&6], 2);
-        assert_eq!(actor.progress.coins, coins);
-        assert!(craft(&mut actor, CUIRASS_RECIPE, &Default::default()).is_err());
-        let mut inventory = vec![];
-        items::include_loot(&mut inventory, &actor.loot);
-        assert!(items::equip(&mut inventory, 1, CUIRASS_RECIPE, true).is_err());
+        let mut c = sheet(&[(CUIRASS_RECIPE, 1), (LEATHER, 12), (7, 8)]);
+        craft(&mut actor, &mut c, CUIRASS_RECIPE).unwrap();
+        craft(&mut actor, &mut c, CUIRASS_RECIPE).unwrap();
+        assert_eq!(in_bag(&c, CUIRASS_RECIPE), 1);
+        assert_eq!(in_bag(&c, LEATHER), 0);
+        assert_eq!(in_bag(&c, 7), 0);
+        // Two separate cuirasses, each its own stack.
+        assert_eq!(c.items.iter().filter(|s| s.kind == 6).count(), 2);
+        assert!(craft(&mut actor, &mut c, CUIRASS_RECIPE).is_err());
     }
     #[test]
-    fn trade_validates_distance_money_equipment_and_potions() {
-        let world = Arc::new(mortown_world::World::new());
-        assert!(world.walkable(mortown_world::MERCHANT[0], mortown_world::MERCHANT[1]));
-        assert!(
-            mortown_world::npcs::definition(mortown_world::npcs::PLAZA_TRADER)
-                .unwrap()
-                .available(
-                    &world,
-                    [
-                        mortown_world::SPAWN[0],
-                        world.surface_height(mortown_world::SPAWN[0], mortown_world::SPAWN[1]),
-                        mortown_world::SPAWN[1]
-                    ]
-                )
-        );
-        let mut sim = Simulation::new(world.clone());
+    fn potion_heals_once_and_never_spends_on_full_or_dead_characters() {
+        let mut sim = Simulation::new(Arc::new(mortown_world::World::new()));
         let mut actor = sim
-            .join(1, "Shop".into(), mortown_world::SPAWN, 0.)
+            .join(1, "Potion".into(), mortown_world::SPAWN, 0.)
             .unwrap();
         actor.hp = 10.;
         actor.max_hp = 100.;
-        actor.progress.coins = 15.;
-        let mut inventory = vec![items::Item {
-            kind: 4,
-            equipped: true,
-        }];
-        actor.loot.insert(4, 2);
-        apply(
-            &mut actor,
-            &inventory,
-            Some((mortown_world::npcs::PLAZA_TRADER, 4, false)),
-            &world,
-        )
-        .unwrap();
-        assert_eq!(actor.loot[&4], 1);
-        assert!(
-            apply(
-                &mut actor,
-                &inventory,
-                Some((mortown_world::npcs::PLAZA_TRADER, 4, false)),
-                &world
-            )
-            .is_err()
-        );
-        assert!(
-            apply(
-                &mut actor,
-                &inventory,
-                Some((mortown_world::npcs::PLAZA_TRADER, 1, false)),
-                &world
-            )
-            .is_err()
-        );
-        assert!(
-            apply(
-                &mut actor,
-                &inventory,
-                Some((mortown_world::npcs::PLAZA_TRADER, 4, true)),
-                &world
-            )
-            .is_err()
-        );
-        assert_eq!(actor.progress.coins, 23.);
-        apply(
-            &mut actor,
-            &inventory,
-            Some((mortown_world::npcs::PLAZA_TRADER, 8, true)),
-            &world,
-        )
-        .unwrap();
-        assert_eq!(actor.progress.coins, 8.);
-        assert!(
-            apply(
-                &mut actor,
-                &inventory,
-                Some((mortown_world::npcs::PLAZA_TRADER, 8, true)),
-                &world
-            )
-            .is_err()
-        );
-        apply(&mut actor, &inventory, None, &world).unwrap();
+        let mut c = sheet(&[]);
+        assert!(potion(&mut actor, &mut c).is_err());
+        let mut c = sheet(&[(items::POTION, 1)]);
+        potion(&mut actor, &mut c).unwrap();
         assert_eq!(actor.hp, 60.);
-        assert_eq!(actor.loot[&8], 0);
-        assert!(apply(&mut actor, &inventory, None, &world).is_err());
-        actor.loot.insert(8, 1);
+        assert!(c.items.is_empty());
+        assert!(potion(&mut actor, &mut c).is_err());
+        assert_eq!(actor.hp, 60.);
+        let mut c = sheet(&[(items::POTION, 1)]);
         actor.hp = 100.;
-        assert!(apply(&mut actor, &inventory, None, &world).is_err());
-        assert_eq!(actor.loot[&8], 1);
+        assert!(potion(&mut actor, &mut c).is_err());
         actor.hp = 0.;
-        assert!(apply(&mut actor, &inventory, None, &world).is_err());
-        assert!(
-            apply(
-                &mut actor,
-                &inventory,
-                Some((mortown_world::npcs::PLAZA_TRADER, 4, false)),
-                &world
-            )
-            .is_err()
-        );
-        actor.hp = 10.;
-        actor.position[0] += 100.;
-        inventory[0].equipped = false;
-        assert!(
-            apply(
-                &mut actor,
-                &inventory,
-                Some((mortown_world::npcs::PLAZA_TRADER, 4, false)),
-                &world
-            )
-            .is_err()
-        );
-        actor.position[0] -= 100.;
-        apply(
-            &mut actor,
-            &inventory,
-            Some((mortown_world::npcs::PLAZA_TRADER, 4, false)),
-            &world,
-        )
-        .unwrap();
-        items::include_loot(&mut inventory, &actor.loot);
-        assert!(!inventory.iter().any(|i| i.kind == 4));
-        assert!(items::equip(&mut inventory, 1, 4, true).is_err());
-        assert!(items::equip(&mut inventory, 1, 8, true).is_err());
+        assert!(potion(&mut actor, &mut c).is_err());
+        assert_eq!(c.items[0].quantity, 1);
+        actor.hp = 80.;
+        potion(&mut actor, &mut c).unwrap();
+        assert_eq!(actor.hp, 100.);
     }
-}
-
-#[cfg(test)]
-mod quest_tests {
-    use super::*;
-    use crate::simulation::Simulation;
-    use std::sync::Arc;
     #[test]
-    fn quest_requires_acceptance_counts_new_kills_and_pays_once() {
-        let world = Arc::new(mortown_world::World::new());
-        let mut sim = Simulation::new(world.clone());
-        let mut actor = sim
-            .join(1, "Quest".into(), mortown_world::SPAWN, 0.)
-            .unwrap();
-        let mut stats = mortown_protocol::starting_stats(1, 1).unwrap();
-        actor.progress = mortown_protocol::progression::Progress::from_stats(&stats);
-        let mut character = Character {
-            id: actor.id,
-            slot: 0,
-            nickname: actor.nickname.clone(),
-            race: 1,
-            class: 1,
-            gender: 1,
-            stats: stats.clone(),
-            inventory: Vec::new(),
-            loot: actor.loot.clone(),
-        };
-        actor.progress.reward(&mut stats);
-        assert_eq!(actor.progress.quest_kills, 0);
-        assert!(quest(&mut actor, &mut character, 1, true, &world).is_err());
-        actor.position[0] += 100.;
-        assert!(quest(&mut actor, &mut character, 1, false, &world).is_err());
-        actor.position[0] -= 100.;
-        actor.hp = 0.;
-        assert!(quest(&mut actor, &mut character, 1, false, &world).is_err());
-        actor.hp = 100.;
-        quest(&mut actor, &mut character, 1, false, &world).unwrap();
-        assert!(quest(&mut actor, &mut character, 1, false, &world).is_err());
-        for _ in 0..2 {
-            actor.progress.reward(&mut stats);
-        }
-        assert!(quest(&mut actor, &mut character, 1, true, &world).is_err());
-        actor.progress.reward(&mut stats);
-        assert_eq!(actor.progress.quest_kills, 3);
-        actor.progress.reward(&mut stats);
-        assert_eq!(actor.progress.quest_kills, 3);
-        let coins = actor.progress.coins;
-        quest(&mut actor, &mut character, 1, true, &world).unwrap();
-        assert_eq!(actor.progress.coins, coins + 75.);
-        assert_eq!(actor.loot[&8], 2);
-        assert!(quest(&mut actor, &mut character, 1, true, &world).is_err());
-        assert!(quest(&mut actor, &mut character, 1, false, &world).is_err());
-        assert_eq!(actor.loot[&8], 2);
-        actor.progress.write_stats(&mut stats);
-        assert_eq!(
-            mortown_protocol::progression::Progress::from_stats(&stats),
-            actor.progress
-        );
-    }
-}
-
-#[cfg(test)]
-mod skill_tests {
-    use super::*;
-    use crate::simulation::Simulation;
-    use std::sync::Arc;
-    #[test]
-    fn skill_learning_requires_level_sp_and_next_rank_once() {
+    fn talent_spend_is_separate_from_craft_experience() {
+        use mortown_protocol::crafting::{CUIRASS_RECIPE, LEATHER};
         let mut sim = Simulation::new(Arc::new(mortown_world::World::new()));
         let mut actor = sim
-            .join(1, "Learn".into(), mortown_world::SPAWN, 0.)
+            .join(1, "Talent".into(), mortown_world::SPAWN, 0.)
             .unwrap();
-        actor.progress.sp = 12.;
-        assert!(learn(&mut actor, 2).is_err());
-        actor.progress.level = 3;
-        assert!(learn(&mut actor, 3).is_err());
+        let mut c = sheet(&[(CUIRASS_RECIPE, 1), (LEATHER, 6), (7, 4)]);
+        let before = c.stats["current_exp"];
+        craft(&mut actor, &mut c, CUIRASS_RECIPE).unwrap();
+        let xp = mortown_protocol::progression::craft_experience();
+        actor.progress.add_experience(xp);
+        assert_eq!(actor.progress.experience, before + f64::from(xp));
+        assert_eq!(actor.progress.talent_points, 0.);
+        assert!(!c.stats.contains_key("talent_craft"));
+        actor.progress.talent_points = 1.;
         actor.hp = 0.;
-        assert!(learn(&mut actor, 2).is_err());
+        assert!(spend_talent(&mut actor, &mut c, "craft", 0).is_err());
         actor.hp = 100.;
-        learn(&mut actor, 2).unwrap();
-        assert_eq!(actor.progress.sp, 7.);
-        assert!(learn(&mut actor, 2).is_err());
-        assert_eq!(actor.progress.sp, 7.);
-        actor.progress.sp = 6.;
-        assert!(learn(&mut actor, 3).is_err());
-        assert_eq!(actor.progress.skill_rank, 2);
-        actor.progress.sp = 7.;
-        learn(&mut actor, 3).unwrap();
-        assert_eq!(actor.progress.sp, 0.);
-        assert!(learn(&mut actor, 4).is_err());
-        assert!(learn(&mut actor, 0).is_err());
-        assert_eq!(actor.progress.skill_rank, 3);
-    }
-}
-
-#[cfg(test)]
-mod secondary_tests {
-    use super::*;
-    use crate::simulation::Simulation;
-    use std::sync::Arc;
-    #[test]
-    fn second_skill_unlock_checks_life_level_sp_and_duplicate_requests() {
-        let mut sim = Simulation::new(Arc::new(mortown_world::World::new()));
-        let mut a = sim
-            .join(1, "Second".into(), mortown_world::SPAWN, 0.)
-            .unwrap();
-        a.progress.sp = 7.;
-        assert!(learn_secondary(&mut a).is_err());
-        a.progress.level = 3;
-        a.hp = 0.;
-        assert!(learn_secondary(&mut a).is_err());
-        a.hp = 100.;
-        a.progress.sp = 6.;
-        assert!(learn_secondary(&mut a).is_err());
-        a.progress.sp = 7.;
-        learn_secondary(&mut a).unwrap();
-        assert!(a.progress.secondary_learned);
-        assert_eq!(a.progress.sp, 0.);
-        assert!(learn_secondary(&mut a).is_err());
-        assert_eq!(a.progress.sp, 0.);
+        spend_talent(&mut actor, &mut c, "craft", 0).unwrap();
+        assert_eq!(c.stats["talent_craft"], 1.);
+        assert_eq!(actor.progress.talent_points, 0.);
+        actor.progress.talent_points = 1.;
+        assert!(spend_talent(&mut actor, &mut c, "craft", 0).is_err());
+        assert_eq!(c.stats["talent_craft"], 1.);
+        assert!(spend_talent(&mut actor, &mut c, "class", 0).is_err());
     }
 }

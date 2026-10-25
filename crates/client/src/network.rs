@@ -1,8 +1,13 @@
+//! Client networking. `Network` (a Bevy resource) owns the WebSocket connection, run on a separate
+//! OS thread with its own Tokio runtime, and stores the latest server state (own actor, players,
+//! monsters, chat/party…). UI modules send requests through `Network` helper methods;
+//! `receive` applies server replies once per frame and moves the hero and other players' models.
 use crate::{Movement, Player, Terrain, character::AnimatedActor};
 use bevy::prelude::*;
 use futures_util::{SinkExt, StreamExt};
 use mortown_protocol::{
-    Actor, Character, ClientMessage, PROTOCOL_VERSION, ServerMessage, WORLD_VERSION,
+    Actor, Character, ClientMessage, PROTOCOL_VERSION, ServerMessage, VERSION_MISMATCH,
+    WORLD_VERSION,
 };
 use std::{
     collections::HashSet,
@@ -11,6 +16,7 @@ use std::{
 };
 use tokio_tungstenite::tungstenite::Message;
 
+/// Sends one frame with a 2 s timeout so a stalled socket can't hang the network thread.
 async fn send_frame<S>(
     socket: &mut tokio_tungstenite::WebSocketStream<S>,
     message: Message,
@@ -24,6 +30,8 @@ where
         .map_err(|_| "Соединение закрыто")
 }
 
+/// Connection state: `Menu` (logged out) → `Connecting` → `Selection` (character list) → `Online`.
+/// `Offline` is only the local visual preview (`--view`), with no server.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     Menu,
@@ -32,24 +40,32 @@ pub enum Mode {
     Online,
     Selection,
 }
+/// What the socket thread passes to `receive`. A plain enum, not a Bevy Event.
 #[allow(clippy::large_enum_variant)]
 enum Event {
     Message(ServerMessage),
     Closed(String),
 }
+/// Connection plus the client's copy of server state; most UI `display` systems read from here.
+/// Never set game results here directly: change them by sending a request and wait for the reply.
 #[derive(Resource)]
 pub struct Network {
     pub mode: Mode,
+    /// Last status/error line shown to the player.
     pub status: String,
+    /// Own persistent sheet (stats and carried stacks), refreshed from server replies.
     pub character: Option<Character>,
     pub characters: Vec<Character>,
     pub selected: Option<i64>,
+    /// A lobby/economy `request` is in flight; blocks sending another until the reply.
     pub pending: bool,
+    /// Bumped on each new character list so the lobby knows to rebuild it.
     pub selection_revision: u64,
     pub registered: bool,
+    /// Own live actor as last reported by the server (position, hp, cooldowns…).
     pub authoritative: Option<Actor>,
+    /// All players in the latest snapshot, including yourself.
     pub roster: Vec<Actor>,
-    pub residents: Vec<mortown_protocol::admin::NpcState>,
     pub monsters: Vec<mortown_protocol::Monster>,
     pub areas: Vec<mortown_protocol::skills::Area>,
     pub alliance: mortown_protocol::alliance::Reply,
@@ -58,14 +74,30 @@ pub struct Network {
     pub party_pending: bool,
     pub party_received_at: f64,
     pub chat: crate::chat::Log,
-    pub mail: crate::mail::Mailbox,
     pub exchange: Option<mortown_protocol::exchange::View>,
     pub exchange_status: String,
     pub exchange_pending: bool,
+    /// Containers and ground stacks near the character (`ServerMessage::Objects`).
+    pub containers: Vec<mortown_protocol::objects::Container>,
+    pub nodes: Vec<mortown_protocol::work::Node>,
+    pub plots: Vec<mortown_protocol::work::Plot>,
+    pub blocks: Vec<mortown_protocol::work::Block>,
+    pub ground: Vec<mortown_protocol::objects::Loose>,
+    /// Fill of castings on the ground. The mesh is built from these cells.
+    pub castings: Vec<mortown_protocol::objects::CastingBody>,
+    /// The chest opened with `objects::Command::Open`, as last committed by the server.
+    pub container: Option<mortown_protocol::objects::View>,
+    pub object_pending: bool,
+    /// Last foundry reply. The drawing on screen is local until the server accepts it.
+    pub casting: Option<mortown_protocol::casting::View>,
     pub address: String,
+    /// Outgoing commands to the socket thread.
     tx: Option<tokio::sync::mpsc::Sender<ClientMessage>>,
+    // Mutex only because Bevy resources must be `Sync` and std `Receiver` is not.
     rx: Option<Mutex<mpsc::Receiver<Event>>>,
+    /// Increasing `Move` counter; the server drops older ones.
     seq: u64,
+    /// Time of the last `Move`, for rate limiting in `intent`.
     sent_at: f64,
 }
 impl Default for Network {
@@ -82,7 +114,6 @@ impl Default for Network {
             authoritative: None,
             roster: vec![],
             monsters: vec![],
-            residents: vec![],
             areas: vec![],
             alliance: default(),
             alliance_pending: false,
@@ -90,10 +121,18 @@ impl Default for Network {
             party_pending: false,
             party_received_at: 0.,
             chat: default(),
-            mail: default(),
             exchange: None,
             exchange_status: String::new(),
             exchange_pending: false,
+            containers: vec![],
+            nodes: vec![],
+            plots: vec![],
+            blocks: vec![],
+            ground: vec![],
+            castings: vec![],
+            container: None,
+            object_pending: false,
+            casting: None,
             address: std::env::var("MORTOWN_SERVER")
                 .unwrap_or_else(|_| "ws://127.0.0.1:3000/world".into()),
             tx: None,
@@ -104,11 +143,14 @@ impl Default for Network {
     }
 }
 impl Network {
+    /// Opens a new connection and sends the first message (`Login` or `Register`).
+    /// Spawns a thread that owns the socket until logout, error or `Saved`/`Registered`.
     pub fn begin(&mut self, message: ClientMessage) {
         self.disconnect();
         self.mode = Mode::Connecting;
         self.registered = false;
         self.status = "Соединяемся с миром…".into();
+        // Bounded queues: 64 incoming frames before the client is considered too slow; 8 outgoing.
         let (events, rx) = mpsc::sync_channel(64);
         let (commands, mut input) = tokio::sync::mpsc::channel::<ClientMessage>(8);
         self.tx = Some(commands);
@@ -127,6 +169,8 @@ impl Network {
                     let mut logout=false;
                     let mut last_received=tokio::time::Instant::now();
                     let mut heartbeat=tokio::time::interval(Duration::from_secs(1));
+                    // Wait for whichever comes first: liveness check, server frame, or outgoing command.
+                    // 15 s without any frame (server pings every 5 s) means the connection is dead.
                     loop { tokio::select! {
                         _=heartbeat.tick()=> { if last_received.elapsed()>Duration::from_secs(15) { return Err("Сервер перестал отвечать"); } }
                         incoming=socket.next() => {
@@ -134,6 +178,7 @@ impl Network {
                             match incoming {
                                 Some(Ok(Message::Text(text))) => {
                                     let message: ServerMessage=serde_json::from_str(&text).map_err(|_| "Несовместимый ответ сервера")?;
+                                    // These two end the session: the server closes after sending them.
                                     let saved=matches!(message,ServerMessage::Saved|ServerMessage::Registered);
                                     match events.try_send(Event::Message(message)) {
                                         Ok(()) => {},
@@ -148,6 +193,7 @@ impl Network {
                             }
                         }
                         command=input.recv(), if !logout => {
+                            // Sender dropped (resource reset) counts as logout so the server saves.
                             let command=command.unwrap_or(ClientMessage::Logout);
                             logout=matches!(command,ClientMessage::Logout);
                             send_frame(&mut socket, Message::Text(serde_json::to_string(&command).map_err(|_| "Ошибка команды")?.into())).await?;
@@ -163,6 +209,7 @@ impl Network {
             ));
         });
     }
+    /// Asks the server to log out (it saves the character) and clears all cached world state.
     pub fn disconnect(&mut self) {
         if let Some(tx) = self.tx.take() {
             let _ = tx.try_send(ClientMessage::Logout);
@@ -175,18 +222,25 @@ impl Network {
         self.pending = false;
         self.roster.clear();
         self.monsters.clear();
-        self.residents.clear();
         self.areas.clear();
         self.alliance = default();
         self.alliance_pending = false;
         self.party = default();
         self.party_pending = false;
         self.chat = default();
-        self.mail = default();
         self.exchange = None;
         self.exchange_status.clear();
         self.exchange_pending = false;
+        self.containers.clear();
+        self.nodes.clear();
+        self.plots.clear();
+        self.blocks.clear();
+        self.ground.clear();
+        self.container = None;
+        self.object_pending = false;
     }
+    /// Subsystem requests (alliance/party/chat/exchange): one in flight per subsystem,
+    /// tracked by its own `*_pending` flag that `receive` clears when the reply arrives.
     pub fn alliance_request(&mut self, command: mortown_protocol::alliance::Command) {
         if self.mode != Mode::Online || self.alliance_pending {
             return;
@@ -230,6 +284,64 @@ impl Network {
             self.chat.status = "Соединение недоступно".into();
         }
     }
+    pub fn society_request(&mut self, command: mortown_protocol::society::Command) {
+        if self.mode != Mode::Online {
+            return;
+        }
+        if let Some(tx) = &self.tx {
+            let _ = tx.try_send(ClientMessage::Society { command });
+        }
+    }
+    pub fn voice(&mut self, speaking: bool) {
+        if self.mode != Mode::Online {
+            return;
+        }
+        if let Some(tx) = &self.tx {
+            let _ = tx.try_send(ClientMessage::Voice { speaking });
+        }
+    }
+    pub fn cast_request(&mut self, command: mortown_protocol::casting::Command) {
+        if self.mode != Mode::Online || self.object_pending {
+            return;
+        }
+        if self
+            .tx
+            .as_ref()
+            .is_some_and(|tx| tx.try_send(ClientMessage::Cast { command }).is_ok())
+        {
+            self.object_pending = true;
+        } else {
+            self.status = "Соединение недоступно".into();
+        }
+    }
+    pub fn work_request(&mut self, command: mortown_protocol::work::Command) {
+        if self.mode != Mode::Online || self.object_pending {
+            return;
+        }
+        if self
+            .tx
+            .as_ref()
+            .is_some_and(|tx| tx.try_send(ClientMessage::Work { command }).is_ok())
+        {
+            self.object_pending = true;
+        } else {
+            self.status = "Соединение недоступно".into();
+        }
+    }
+    pub fn object_request(&mut self, command: mortown_protocol::objects::Command) {
+        if self.mode != Mode::Online || self.object_pending {
+            return;
+        }
+        if self
+            .tx
+            .as_ref()
+            .is_some_and(|tx| tx.try_send(ClientMessage::Objects { command }).is_ok())
+        {
+            self.object_pending = true;
+        } else {
+            self.status = "Соединение недоступно".into();
+        }
+    }
     pub fn exchange_request(&mut self, command: mortown_protocol::exchange::Command) {
         if self.mode != Mode::Online || self.exchange_pending {
             return;
@@ -245,21 +357,8 @@ impl Network {
             self.exchange_status = "Соединение недоступно".into();
         }
     }
-    pub fn mail_request(&mut self, command: mortown_protocol::mail::Command) {
-        if self.mode != Mode::Online || self.mail.pending {
-            return;
-        }
-        if self
-            .tx
-            .as_ref()
-            .is_some_and(|tx| tx.try_send(ClientMessage::Mail { command }).is_ok())
-        {
-            self.mail.pending = true;
-            self.mail.status = "Подождите…".into();
-        } else {
-            self.mail.status = "Соединение недоступно".into();
-        }
-    }
+    /// Lobby/economy request (craft, equip, potion…). Sets `pending` until the server answers,
+    /// so double clicks can't send duplicates.
     pub fn request(&mut self, message: ClientMessage) {
         if self.pending {
             return;
@@ -275,6 +374,7 @@ impl Network {
             self.status = "Соединение недоступно".into();
         }
     }
+    /// Fire-and-forget in-world action (attack, skill, respawn); results come via snapshots.
     pub fn action(&mut self, message: ClientMessage) {
         if self.mode != Mode::Online {
             return;
@@ -297,6 +397,8 @@ impl Network {
             }
         }
     }
+    /// Movement wish: "walk toward `target` [x, z]". Sent at most every 45 ms (~22/s), slightly
+    /// faster than the 50 ms server tick; extra calls are silently dropped.
     pub fn intent(&mut self, time: f64, target: [f32; 2], walking: bool) {
         if self.mode != Mode::Online || time - self.sent_at < 0.045 {
             return;
@@ -311,6 +413,7 @@ impl Network {
             });
         }
     }
+    /// Admin click-teleport; the server rejects it without the `click_teleport` power.
     pub fn teleport(&mut self, target: [f32; 2]) {
         if self.mode != Mode::Online {
             return;
@@ -319,16 +422,20 @@ impl Network {
             let _ = tx.try_send(ClientMessage::Teleport { target });
         }
     }
+    /// True when the 3D world is active (online or offline preview), i.e. not in menus/lobby.
     pub fn playing(&self) -> bool {
         matches!(self.mode, Mode::Offline | Mode::Online)
     }
 }
+/// Another player's model; `target`/`yaw` are the latest server values it is smoothed toward.
 #[derive(Component)]
 pub struct Remote {
     pub id: i64,
     target: Vec3,
     yaw: f32,
 }
+/// Runs early in `Update`: drains all queued server messages into `Network`, then smoothly moves
+/// the hero to the server position and spawns/moves/despawns `Remote` players.
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 pub fn receive(
     mut commands: Commands,
@@ -350,9 +457,11 @@ pub fn receive(
             Event::Message(ServerMessage::Alliance { mut reply })
                 if network.mode == Mode::Online =>
             {
+                // `response` = answer to our own request (vs. a broadcast refresh).
                 if reply.response {
                     network.alliance_pending = false;
                 }
+                // A broadcast refresh has no text; keep the last message for the same alliance.
                 if reply.message.is_empty()
                     && reply.alliance.as_ref().map(|a| a.id)
                         == network.alliance.alliance.as_ref().map(|a| a.id)
@@ -360,6 +469,11 @@ pub fn receive(
                     reply.message = network.alliance.message.clone();
                 }
                 network.alliance = reply;
+            }
+            Event::Message(ServerMessage::Hearing { label, .. })
+                if network.mode == Mode::Online =>
+            {
+                network.status = format!("{label} говорит рядом");
             }
             Event::Message(ServerMessage::Party { reply }) if network.mode == Mode::Online => {
                 network.party_received_at = time.elapsed_secs_f64();
@@ -398,8 +512,8 @@ pub fn receive(
                 network.status = reply.message;
                 network.exchange_pending = false;
             }
-            Event::Message(ServerMessage::Mail { reply }) if network.mode == Mode::Online => {
-                if let Some(update) = reply.inventory_update()
+            Event::Message(ServerMessage::Cast { view }) if network.mode == Mode::Online => {
+                if let Some(update) = view.update.as_ref()
                     && network
                         .character
                         .as_ref()
@@ -408,7 +522,46 @@ pub fn receive(
                     network.character = Some(update.character.clone());
                     network.authoritative = Some(update.actor.clone());
                 }
-                network.mail.receive(reply);
+                network.status = view.message.clone();
+                network.casting = Some(view);
+                network.object_pending = false;
+            }
+            Event::Message(ServerMessage::Objects {
+                containers,
+                ground,
+                nodes,
+                plots,
+                blocks,
+                castings,
+            }) if network.mode == Mode::Online => {
+                // An open chest that is no longer there (lifted by someone) closes.
+                if let Some(open) = network.container.as_ref()
+                    && !containers.iter().any(|c| c.id == open.container.id)
+                {
+                    network.container = None;
+                }
+                network.containers = containers;
+                network.ground = ground;
+                network.castings = castings;
+                network.nodes = nodes;
+                network.plots = plots;
+                network.blocks = blocks;
+            }
+            Event::Message(ServerMessage::Object { reply }) if network.mode == Mode::Online => {
+                if let Some(update) = reply.update
+                    && network
+                        .character
+                        .as_ref()
+                        .is_some_and(|c| c.id == update.character.id)
+                {
+                    network.character = Some(update.character);
+                    network.authoritative = Some(update.actor);
+                }
+                if reply.view.is_some() {
+                    network.container = reply.view;
+                }
+                network.status = reply.message;
+                network.object_pending = false;
             }
             Event::Message(ServerMessage::EconomyUpdated { character, actor }) => {
                 if network.mode == Mode::Online
@@ -430,6 +583,8 @@ pub fn receive(
                         .as_ref()
                         .is_some_and(|c| c.id == character.id)
                 {
+                    // The DB sheet may lag behind live progress: re-apply level growth, XP, loot
+                    // and current resources from the live actor unless the sheet is newer.
                     if let Some(a) = network.authoritative.as_ref() {
                         if a.progress.kills
                             >= character.stats.get("kills").copied().unwrap_or(0.) as u64
@@ -440,11 +595,6 @@ pub fn receive(
                                 a.progress.level.saturating_sub(old_level),
                             );
                             a.progress.write_stats(&mut character.stats);
-                            character.loot = a.loot.clone();
-                            mortown_protocol::items::include_loot(
-                                &mut character.inventory,
-                                &character.loot,
-                            );
                         }
                         character.stats.insert("current_hp".into(), a.hp);
                         character.stats.insert("current_mana".into(), a.mana);
@@ -486,7 +636,6 @@ pub fn receive(
                 network.party = default();
                 network.party_pending = false;
                 network.chat = default();
-                network.mail = default();
                 network.status = if network.characters.is_empty() {
                     "Создайте первого персонажа".into()
                 } else {
@@ -500,9 +649,10 @@ pub fn receive(
                 character,
                 actor,
             }) => {
+                // Different message format or world geometry would desync movement/collision.
                 if version != PROTOCOL_VERSION || version_world != WORLD_VERSION {
                     network.disconnect();
-                    network.status = "Версия мира не совпадает".into();
+                    network.status = VERSION_MISMATCH.into();
                     continue;
                 }
                 if network.mode != Mode::Selection {
@@ -525,7 +675,6 @@ pub fn receive(
             Event::Message(ServerMessage::Snapshot {
                 actors,
                 monsters,
-                residents,
                 areas,
                 ..
             }) if network.mode == Mode::Online => {
@@ -536,6 +685,7 @@ pub fn receive(
                     if a.hp <= 0. {
                         *movement = Movement::default();
                     }
+                    // Same live-progress merge as in `CharacterUpdated`, so HUD/stats track every tick.
                     if let Some(c) = network.character.as_mut() {
                         if a.progress.kills >= c.stats.get("kills").copied().unwrap_or(0.) as u64 {
                             let old_level = c.stats["level"] as u32;
@@ -544,15 +694,12 @@ pub fn receive(
                                 a.progress.level.saturating_sub(old_level),
                             );
                             a.progress.write_stats(&mut c.stats);
-                            c.loot = a.loot.clone();
-                            mortown_protocol::items::include_loot(&mut c.inventory, &c.loot);
                         }
                         c.stats.insert("current_hp".into(), a.hp);
                         c.stats.insert("current_mana".into(), a.mana);
                         c.stats.insert("current_stamina".into(), a.stamina);
                     }
                 }
-                network.residents = residents;
                 network.monsters = monsters;
                 network.areas = areas;
                 network.roster = actors;
@@ -560,6 +707,7 @@ pub fn receive(
             Event::Message(ServerMessage::Error { message, fatal }) => {
                 network.status = message;
                 network.pending = false;
+                network.object_pending = false;
                 if fatal {
                     network.disconnect();
                 }
@@ -590,6 +738,7 @@ pub fn receive(
     }
     if let Some(actor) = &network.authoritative {
         let target = Vec3::from_array(actor.position);
+        // Exponential smoothing toward the server position; rate 25/s ≈ catches up in ~0.1 s.
         let alpha = 1. - (-time.delta_secs() * 25.).exp();
         let next = hero.translation.lerp(target, alpha);
         let previous_position = hero.translation;
@@ -608,6 +757,7 @@ pub fn receive(
             .surface_height(hero.translation.x, hero.translation.z);
         hero.rotation = hero.rotation.slerp(Quat::from_rotation_y(actor.yaw), alpha);
     }
+    // Sync `Remote` entities with the roster: despawn leavers, smooth existing, spawn newcomers.
     let own = network.character.as_ref().map(|p| p.id);
     let ids: HashSet<_> = network.roster.iter().map(|p| p.id).collect();
     let existing: HashSet<_> = remotes.iter().map(|(_, p, _)| p.id).collect();
@@ -620,6 +770,7 @@ pub fn receive(
             remote.target = Vec3::from_array(a.position);
             remote.yaw = a.yaw;
         }
+        // Slightly softer than the hero (20 vs 25); same corner-snap rule as above.
         let next = transform
             .translation
             .lerp(remote.target, 1. - (-time.delta_secs() * 20.).exp());
@@ -652,6 +803,7 @@ pub fn receive(
                     .with_rotation(Quat::from_rotation_y(actor.yaw)),
                 Visibility::default(),
             ))
+            // The glTF model is a child so animation/equipment systems can find it via `Wearer`.
             .with_children(|p| {
                 p.spawn((
                     SceneRoot(
