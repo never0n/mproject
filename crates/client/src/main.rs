@@ -239,7 +239,7 @@ fn main() {
                     .chain(),
                 (
                     crafting::display,
-                    foundry::display,
+                    (foundry::display, foundry::preview).chain(),
                     inventory::display,
                     skills::display,
                     menu::display,

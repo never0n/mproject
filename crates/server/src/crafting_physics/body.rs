@@ -137,8 +137,34 @@ pub struct SolidCell {
     pub thickness: f64,
     pub fill: f64,
     pub temperature: f64,
-    /// Finished edge thickness. Zero means the section is still a rectangle.
-    pub edge: f64,
+    /// Finished edge thickness of the `[left, right]` side. Zero keeps that side a rectangle.
+    pub edges: [f64; 2],
+}
+
+impl SolidCell {
+    fn occupied(&self) -> bool {
+        self.fill > 0. && self.thickness > 0.
+    }
+
+    /// Share of the rectangular section left after the bevels. Each side's bevel spans the
+    /// outer quarter of the width from the full thickness down to its edge; with equal edges
+    /// on both sides this is the published `(3t + e) / 4t`.
+    fn section_share(&self) -> f64 {
+        let t = self.thickness;
+        1. - self
+            .edges
+            .iter()
+            .filter(|edge| **edge > 0.)
+            .map(|edge| (t - edge) / (8. * t))
+            .sum::<f64>()
+    }
+
+    fn metal_volume(&self) -> f64 {
+        if !self.occupied() {
+            return 0.;
+        }
+        self.fill * self.length * self.width * self.thickness * self.section_share()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -243,53 +269,60 @@ pub fn cool_lumped(
     (out, seconds)
 }
 
-/// Bevel existing metal. Empty cells stay empty. A second call removes nothing.
+/// Grind the chosen `[left, right]` sides of the cells whose middle lies in `zone` (metres of
+/// the drawing) down to `edge`. A side that is already as thin or thinner is left alone, so a
+/// pass never adds metal and a repeated pass removes nothing. Empty cells stay empty.
 /// No handle is added: a grip that was not poured is not invented.
 pub fn bevel_cells(
     cells: &[SolidCell],
     edge: f64,
+    sides: [bool; 2],
+    zone: (f64, f64),
     mass: f64,
     solidus: f64,
 ) -> Result<Bevel, &'static str> {
     if edge <= 0. || !edge.is_finite() {
         return Err("Нет такой кромки");
     }
-    let occupied = |cell: &SolidCell| cell.fill > 0. && cell.thickness > 0.;
+    if !sides.iter().any(|side| *side) {
+        return Err("Не выбрана сторона");
+    }
+    if !(zone.0.is_finite() && zone.1.is_finite() && zone.0 < zone.1) {
+        return Err("Зона обработки пуста");
+    }
     if cells
         .iter()
-        .any(|cell| occupied(cell) && cell.temperature > solidus + 0.5)
+        .any(|cell| cell.occupied() && cell.temperature > solidus + 0.5)
     {
         return Err("Сначала остудите заготовку");
     }
-    if cells.iter().any(|cell| occupied(cell) && cell.edge > 0.) {
-        return Ok(bevel_report(cells, mass, 0.));
+    let inside = |cell: &SolidCell| {
+        let mid = cell.x0 + 0.5 * cell.length;
+        cell.occupied() && mid >= zone.0 && mid <= zone.1
+    };
+    if !cells.iter().any(inside) {
+        return Err("В этой зоне нет металла");
     }
     if cells
         .iter()
-        .any(|cell| occupied(cell) && edge >= cell.thickness)
+        .any(|cell| inside(cell) && edge >= cell.thickness)
     {
         return Err("Кромка толще заготовки");
     }
-    let mut next = cells.to_vec();
-    let mut before = 0.;
-    let mut after = 0.;
-    for cell in &next {
-        if !occupied(cell) {
-            continue;
-        }
-        let volume = cell.fill * cell.length * cell.width * cell.thickness;
-        before += volume;
-        after += volume * (3. * cell.thickness + edge) / (4. * cell.thickness);
-    }
+    let before: f64 = cells.iter().map(SolidCell::metal_volume).sum();
     if before <= 0. || mass <= 0. {
         return Err("Снимать нечего");
     }
-    let removed = mass * (1. - after / before);
-    for cell in &mut next {
-        if occupied(cell) {
-            cell.edge = edge;
+    let mut next = cells.to_vec();
+    for cell in next.iter_mut().filter(|cell| inside(cell)) {
+        for (current, chosen) in cell.edges.iter_mut().zip(sides) {
+            if chosen && (*current <= 0. || edge < *current) {
+                *current = edge;
+            }
         }
     }
+    let after: f64 = next.iter().map(SolidCell::metal_volume).sum();
+    let removed = (mass * (1. - after / before)).max(0.);
     Ok(bevel_report(&next, mass - removed, removed))
 }
 
@@ -303,46 +336,22 @@ fn bevel_report(cells: &[SolidCell], mass: f64, removed: f64) -> Bevel {
     let mut moment = 0.;
     let mut spin = 0.;
     let mut metal = 0.;
-    let share: f64 = cells
-        .iter()
-        .map(|cell| {
-            if cell.fill <= 0. || cell.thickness <= 0. {
-                0.
-            } else {
-                let factor = if cell.edge > 0. {
-                    (3. * cell.thickness + cell.edge) / (4. * cell.thickness)
-                } else {
-                    1.
-                };
-                cell.fill * cell.length * cell.width * cell.thickness * factor
-            }
-        })
-        .sum();
+    let share: f64 = cells.iter().map(SolidCell::metal_volume).sum();
     for cell in cells {
-        if cell.fill <= 0. || cell.thickness <= 0. || share <= 0. {
+        if !cell.occupied() || share <= 0. {
             continue;
         }
-        let factor = if cell.edge > 0. {
-            (3. * cell.thickness + cell.edge) / (4. * cell.thickness)
-        } else {
-            1.
-        };
-        let part = mass * cell.fill * cell.length * cell.width * cell.thickness * factor / share;
+        let part = mass * cell.metal_volume() / share;
         let mid = cell.x0 + 0.5 * cell.length;
         moment += part * mid;
         metal += part;
     }
     let center = if metal > 0. { moment / metal } else { 0. };
     for cell in cells {
-        if cell.fill <= 0. || cell.thickness <= 0. || share <= 0. {
+        if !cell.occupied() || share <= 0. {
             continue;
         }
-        let factor = if cell.edge > 0. {
-            (3. * cell.thickness + cell.edge) / (4. * cell.thickness)
-        } else {
-            1.
-        };
-        let part = mass * cell.fill * cell.length * cell.width * cell.thickness * factor / share;
+        let part = mass * cell.metal_volume() / share;
         let mid = cell.x0 + 0.5 * cell.length;
         spin += part * (mid - center).powi(2)
             + part * (cell.width.powi(2) + cell.thickness.powi(2)) / 12.;
@@ -435,7 +444,7 @@ mod tests {
             thickness: 0.006,
             fill: 1.,
             temperature: 1004.,
-            edge: 0.,
+            edges: [0., 0.],
         };
         let (cooled, seconds) = cool_lumped(&[cell], 1.2, 60., 200., &c90700());
         assert!(seconds > 0.);
@@ -466,7 +475,7 @@ mod tests {
             thickness: 0.006,
             fill: 1.,
             temperature: 300.,
-            edge: 0.,
+            edges: [0., 0.],
         };
         let empty = SolidCell {
             x0: 0.1,
@@ -476,23 +485,89 @@ mod tests {
         };
         let mut molten = full;
         molten.temperature = 1040.;
-        assert!(bevel_cells(&[molten], 0.0001, 1., 831.).is_err());
+        assert!(bevel_cells(&[molten], 0.0001, BOTH, WHOLE, 1., 831.).is_err());
         let mut thin = full;
         thin.thickness = 0.0001;
         assert!(
-            bevel_cells(&[thin], 0.0001, 1., 831.)
+            bevel_cells(&[thin], 0.0001, BOTH, WHOLE, 1., 831.)
                 .unwrap_err()
                 .contains("толще")
         );
-        let cut = bevel_cells(&[full, empty], 0.0001, 1., 831.).unwrap();
+        let cut = bevel_cells(&[full, empty], 0.0001, BOTH, WHOLE, 1., 831.).unwrap();
         let remain = (3. * 0.006 + 0.0001) / (4. * 0.006);
         assert!((cut.mass - remain).abs() < 1e-9, "{}", cut.mass);
         assert!((cut.removed - (1. - remain)).abs() < 1e-9);
         assert_eq!(cut.cells[1].fill, 0.);
-        assert_eq!(cut.cells[1].edge, 0.);
-        assert!((cut.cells[0].edge - 0.0001).abs() < 1e-12);
-        let twice = bevel_cells(&cut.cells, 0.0001, cut.mass, 831.).unwrap();
+        assert_eq!(cut.cells[1].edges, [0., 0.]);
+        assert!(
+            cut.cells[0]
+                .edges
+                .iter()
+                .all(|e| (e - 0.0001).abs() < 1e-12)
+        );
+        let twice = bevel_cells(&cut.cells, 0.0001, BOTH, WHOLE, cut.mass, 831.).unwrap();
         assert_eq!(twice.removed, 0.);
         assert!((twice.mass - cut.mass).abs() < 1e-12);
+        let blunter = bevel_cells(&cut.cells, 0.002, BOTH, WHOLE, cut.mass, 831.).unwrap();
+        assert_eq!(blunter.removed, 0., "a blunter pass cannot put metal back");
+        assert_eq!(blunter.cells[0].edges, cut.cells[0].edges);
+        assert!(
+            bevel_cells(&[full, empty], 0.0001, BOTH, (0.1, 0.2), 1., 831.)
+                .unwrap_err()
+                .contains("нет металла"),
+            "the unfilled part of a misrun is not ground"
+        );
+    }
+
+    const BOTH: [bool; 2] = [true, true];
+    const WHOLE: (f64, f64) = (f64::MIN, f64::MAX);
+
+    fn bar(x0: f64) -> SolidCell {
+        SolidCell {
+            x0,
+            length: 0.1,
+            width: 0.04,
+            thickness: 0.006,
+            fill: 1.,
+            temperature: 300.,
+            edges: [0., 0.],
+        }
+    }
+
+    #[test]
+    fn one_side_is_half_the_metal_of_both_and_stays_asymmetric() {
+        let cells = [bar(0.)];
+        let both = bevel_cells(&cells, 0.001, BOTH, WHOLE, 1., 831.).unwrap();
+        let left = bevel_cells(&cells, 0.001, [true, false], WHOLE, 1., 831.).unwrap();
+        assert_eq!(left.cells[0].edges, [0.001, 0.]);
+        assert!(left.removed > 0.);
+        assert!((left.removed * 2. - both.removed).abs() < 1e-12);
+        let right = bevel_cells(&left.cells, 0.001, [false, true], WHOLE, left.mass, 831.).unwrap();
+        assert_eq!(right.cells[0].edges, [0.001, 0.001]);
+        assert!((right.mass - both.mass).abs() < 1e-12);
+        let sharper =
+            bevel_cells(&left.cells, 0.0005, [true, false], WHOLE, left.mass, 831.).unwrap();
+        let expected = left.mass * (1. - (0.001 - 0.0005) / 8. / (0.006 - (0.006 - 0.001) / 8.));
+        assert!((sharper.mass - expected).abs() < 1e-12, "{}", sharper.mass);
+    }
+
+    #[test]
+    fn a_zone_grinds_only_its_cells_and_moves_the_balance() {
+        let cells = [bar(0.), bar(0.1), bar(0.2)];
+        let (center, _) = mass_axes(&cells, 3.);
+        let tip = bevel_cells(&cells, 0.001, BOTH, (0.2, 0.3), 3., 831.).unwrap();
+        assert_eq!(tip.cells[0].edges, [0., 0.]);
+        assert_eq!(tip.cells[1].edges, [0., 0.]);
+        assert_eq!(tip.cells[2].edges, [0.001, 0.001]);
+        assert!(tip.removed > 0.);
+        assert!(
+            tip.center < center,
+            "lighter tip moves the centre toward the tang"
+        );
+        assert!(
+            bevel_cells(&cells, 0.001, [false, false], WHOLE, 3., 831.).is_err(),
+            "a pass needs a side"
+        );
+        assert!(bevel_cells(&cells, 0.001, BOTH, (0.3, 0.2), 3., 831.).is_err());
     }
 }
