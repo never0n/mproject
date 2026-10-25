@@ -12,6 +12,7 @@ pub fn setup(
     mut panels: ResMut<CharacterWindow>,
     mut combat: ResMut<crate::combat::CombatUi>,
     mut menu: ResMut<crate::menu::Help>,
+    mut foundry: ResMut<crate::foundry::Board>,
 ) {
     let Some(screen) = &options.ui_preview else {
         return;
@@ -179,7 +180,7 @@ pub fn setup(
         });
     }
     *panels = CharacterWindow {
-        open: screen != "hud" && screen != "target",
+        open: !matches!(screen.as_str(), "hud" | "target" | "foundry"),
         inventory: screen == "inventory" || screen == "tooltip",
         skills: screen == "skills",
         menu: screen == "menu",
@@ -187,6 +188,10 @@ pub fn setup(
     };
     if screen == "menu" {
         menu.0 = false;
+    }
+    if screen == "foundry" {
+        foundry.open = true;
+        foundry.example();
     }
 }
 

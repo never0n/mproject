@@ -63,6 +63,14 @@ impl Default for Board {
         }
     }
 }
+impl Board {
+    pub(crate) fn example(&mut self) {
+        let (points, thickness) = casting::example_sword();
+        self.points = points;
+        self.thickness = resample(&thickness);
+        self.closed = true;
+    }
+}
 
 #[derive(Component)]
 pub(crate) struct Overlay;
@@ -351,12 +359,7 @@ pub fn input(
         }
         match action {
             Action::Back => board.open = false,
-            Action::Example => {
-                let (points, thickness) = casting::example_sword();
-                board.points = points;
-                board.thickness = resample(&thickness);
-                board.closed = true;
-            }
+            Action::Example => board.example(),
             Action::Close if board.points.len() >= 4 => board.closed = true,
             Action::Undo => {
                 board.points.pop();
@@ -567,8 +570,8 @@ pub fn display(
         (&Segment, &mut Node, &mut UiTransform),
         (Without<Dot>, Without<Overlay>, Without<Mark>),
     >,
-    mut zone_mark: Query<&mut Node, (With<ZoneMark>, Without<StationMark>)>,
-    mut station_mark: Query<&mut Node, (With<StationMark>, Without<ZoneMark>)>,
+    mut zone_mark: Query<&mut Node, (With<Mark>, With<ZoneMark>, Without<StationMark>)>,
+    mut station_mark: Query<&mut Node, (With<Mark>, With<StationMark>, Without<ZoneMark>)>,
     bars: Query<Entity, With<Bars>>,
     strips: Query<Entity, With<StripBars>>,
 ) {

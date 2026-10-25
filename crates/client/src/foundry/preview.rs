@@ -54,8 +54,8 @@ impl Default for Orbit {
     fn default() -> Self {
         Self {
             source: Source::Design,
-            yaw: -0.35,
-            pitch: 0.45,
+            yaw: -0.15,
+            pitch: -0.55,
             drag: None,
             shown: None,
         }
@@ -223,7 +223,7 @@ pub fn update(
                     let radius = (max - min).max(20) as f32 / 2000.;
                     // The view is four times wider than tall: fit the length across it, and keep
                     // the near end clear of the camera when the blade is turned toward it.
-                    let distance = radius * 1.6 + 0.02;
+                    let distance = radius * 1.15 + 0.02;
                     *camera.1 =
                         Transform::from_xyz(0., 0., distance).looking_at(Vec3::ZERO, Vec3::Y);
                     note.0 = format!("{text}. Перетащите мышью, чтобы повернуть");
@@ -240,5 +240,7 @@ pub fn update(
         }
         board.orbit.shown = Some(key);
     }
-    body.1.rotation = Quat::from_euler(EulerRot::YXZ, board.orbit.yaw, board.orbit.pitch, 0.);
+    // The shell lies on the ground with its thickness up; the zero pose faces its flat side.
+    body.1.rotation = Quat::from_euler(EulerRot::YXZ, board.orbit.yaw, board.orbit.pitch, 0.)
+        * Quat::from_rotation_x(std::f32::consts::FRAC_PI_2);
 }
