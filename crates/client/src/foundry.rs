@@ -9,6 +9,9 @@ use crate::{
 use bevy::{prelude::*, ui::FocusPolicy, window::PrimaryWindow};
 use mortown_protocol::casting::{self, Command, DefectKind, Phase, Side};
 
+mod preview;
+pub use preview::update as preview;
+
 const MARKS: usize = 48;
 /// Thickness samples evenly spaced from the first to the last point along the length.
 /// The server accepts 2–8 and interpolates between them.
@@ -38,6 +41,7 @@ pub struct Board {
     zone: Option<(i32, i32)>,
     /// The first strip click set a zone start and waits for the end.
     zone_start: Option<i32>,
+    orbit: preview::Orbit,
 }
 impl Default for Board {
     fn default() -> Self {
@@ -55,6 +59,7 @@ impl Default for Board {
             side: Side::Both,
             zone: None,
             zone_start: None,
+            orbit: preview::Orbit::default(),
         }
     }
 }
@@ -102,10 +107,21 @@ pub(crate) enum Action {
     EdgeStep(i16),
     WholeZone,
     Machine,
+    /// Store the drawing with the passes that removed metal from the current blank.
+    Record,
+    Finish,
+    Source,
+    ResetView,
 }
 
-pub fn setup(mut commands: Commands, icons: Res<Icons>) {
+pub fn setup(
+    mut commands: Commands,
+    icons: Res<Icons>,
+    mut images: ResMut<Assets<Image>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+) {
     commands.init_resource::<Board>();
+    let view = preview::spawn_scene(&mut commands, &mut images, &mut materials);
     commands
         .spawn((
             Overlay,
@@ -244,6 +260,19 @@ pub fn setup(mut commands: Commands, icons: Res<Icons>) {
                         BackgroundColor(Color::srgb(0.93, 0.84, 0.62)),
                     ));
                 });
+                p.spawn((
+                    preview::View3d,
+                    FocusPolicy::Block,
+                    ImageNode::new(view),
+                    Node {
+                        width: px(preview::WIDTH),
+                        height: px(preview::HEIGHT),
+                        border: UiRect::all(px(1)),
+                        ..default()
+                    },
+                    BorderColor::all(EDGE),
+                ));
+                p.spawn((preview::PreviewNote, actionbar::label("", &icons.1, 12.)));
                 p.spawn((Note, actionbar::label("", &icons.1, 13.)));
                 p.spawn(Node {
                     column_gap: px(8),
@@ -275,6 +304,10 @@ pub fn setup(mut commands: Commands, icons: Res<Icons>) {
                     button(p, &icons, Action::EdgeStep(1), "Кромка +0,1 мм");
                     button(p, &icons, Action::WholeZone, "Вся длина");
                     button(p, &icons, Action::Machine, "Заточить");
+                    button(p, &icons, Action::Record, "Записать обработку в чертёж");
+                    button(p, &icons, Action::Finish, "Обработать по чертежу");
+                    button(p, &icons, Action::Source, "3D: проект / отливка");
+                    button(p, &icons, Action::ResetView, "Сбросить поворот");
                     button(p, &icons, Action::Back, "← К ремеслу");
                 });
             });
@@ -306,6 +339,7 @@ pub fn input(
     buttons: Query<(&Action, &Interaction), Changed<Interaction>>,
     canvas: Query<(&ComputedNode, &UiGlobalTransform), With<Canvas>>,
     strip: Query<(&ComputedNode, &UiGlobalTransform), With<Strip>>,
+    view3d: Query<(&ComputedNode, &UiGlobalTransform), With<preview::View3d>>,
 ) {
     if network.mode != Mode::Online {
         board.open = false;
@@ -364,12 +398,45 @@ pub fn input(
             }
             Action::Save if !network.object_pending && board.closed => {
                 let revision = board.revision;
+                let passes = network
+                    .casting
+                    .as_ref()
+                    .map(|view| view.blueprint_passes.clone())
+                    .unwrap_or_default();
                 network.cast_request(Command::Save {
                     revision,
                     points: board.points.clone(),
                     thickness_mm: board.thickness.to_vec(),
+                    passes,
                 });
             }
+            Action::Record if !network.object_pending && board.closed => {
+                if let Some(view) = network
+                    .casting
+                    .as_ref()
+                    .filter(|view| !view.passes.is_empty())
+                {
+                    let command = Command::Save {
+                        revision: board.revision,
+                        points: board.points.clone(),
+                        thickness_mm: board.thickness.to_vec(),
+                        passes: view.passes.clone(),
+                    };
+                    network.cast_request(command);
+                }
+            }
+            Action::Finish if !network.object_pending => {
+                if let Some(item) = network.casting.as_ref().and_then(|view| view.result_item) {
+                    network.cast_request(Command::Finish { item });
+                }
+            }
+            Action::Source => {
+                board.orbit.source = match board.orbit.source {
+                    preview::Source::Design => preview::Source::Blank,
+                    preview::Source::Blank => preview::Source::Design,
+                };
+            }
+            Action::ResetView => board.orbit.reset(),
             Action::Charge if !network.object_pending => {
                 network.cast_request(Command::Charge {
                     revision: board.revision,
@@ -412,6 +479,24 @@ pub fn input(
     let Some(cursor) = window.physical_cursor_position() else {
         return;
     };
+    if mouse.just_released(MouseButton::Left) {
+        board.orbit.drag = None;
+    }
+    if board.open
+        && mouse.just_pressed(MouseButton::Left)
+        && let Some((node, transform)) = view3d.iter().next()
+        && actionbar::contains(node, transform, cursor)
+    {
+        board.orbit.drag = Some(cursor);
+        return;
+    }
+    if let Some(last) = board.orbit.drag {
+        if mouse.pressed(MouseButton::Left) {
+            board.orbit.turn(cursor - last);
+            board.orbit.drag = Some(cursor);
+        }
+        return;
+    }
     if board.open
         && mouse.just_pressed(MouseButton::Left)
         && let Some((node, transform)) = strip.iter().next()
@@ -538,8 +623,20 @@ pub fn display(
             .collect::<Vec<_>>()
             .join(" / ");
         let pass = pass_note(&board);
+        let record = network
+            .casting
+            .as_ref()
+            .filter(|view| !view.passes.is_empty() || !view.blueprint_passes.is_empty())
+            .map(|view| {
+                format!(
+                    "Проходов в чертеже: {}, снято с отливки: {}. ",
+                    view.blueprint_passes.len(),
+                    view.passes.len()
+                )
+            })
+            .unwrap_or_default();
         text.0 = format!(
-            "Длина {length} мм, ширина {width} мм. Толщина {thickness} мм. {edge}{pass}В тигель {} г. {phase}. {metal}{balance}{defects}{}",
+            "Длина {length} мм, ширина {width} мм. Толщина {thickness} мм. {edge}{pass}{record}В тигель {} г. {phase}. {metal}{balance}{defects}{}",
             u32::from(board.units) * 100,
             network.status
         );

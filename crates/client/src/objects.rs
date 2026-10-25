@@ -329,7 +329,7 @@ pub fn sync(
     }
 }
 
-fn blade_mesh(spans: &[mortown_protocol::casting::Span]) -> Option<Mesh> {
+pub(crate) fn blade_mesh(spans: &[mortown_protocol::casting::Span]) -> Option<Mesh> {
     let vertices = mortown_protocol::casting::blank_shell(spans);
     if vertices.is_empty() {
         return None;
