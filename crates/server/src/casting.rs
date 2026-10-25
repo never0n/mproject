@@ -14,8 +14,8 @@ use crate::{
 use mortown_protocol::{
     Actor, Character,
     casting::{
-        BRONZE_MG, Command, Defect, DefectKind, MATERIAL_ID, MATERIAL_VERSION, MAX_POINTS, Phase,
-        SOLVER_VERSION, Side, Span, TIME_SCALE, View,
+        BRONZE_MG, Command, Defect, DefectKind, MATERIAL_ID, MATERIAL_VERSION, MAX_PASSES, Pass,
+        Phase, PlanProblem, SOLVER_VERSION, Side, Span, TIME_SCALE, View, plan,
     },
     items::{self, Location, Stack},
     objects::REACH,
@@ -56,7 +56,8 @@ pub async fn handle(
             revision,
             points,
             thickness_mm,
-        } => save(conn, &actor, revision, &points, &thickness_mm).await,
+            passes,
+        } => save(conn, &actor, revision, &points, &thickness_mm, &passes).await,
         Command::Charge { revision, units } => charge(conn, actor, revision, units).await,
         Command::Heat { revision, target_c } => heat_charge(conn, &actor, revision, target_c).await,
         Command::Pour {
@@ -86,6 +87,7 @@ pub async fn handle(
             };
             machine_blank(conn, &actor, item, pass).await
         }
+        Command::Finish { item } => finish_blank(conn, &actor, item).await,
     }
 }
 
@@ -95,13 +97,20 @@ async fn save(
     revision: u64,
     points: &[[i32; 2]],
     thickness: &[u16],
+    passes: &[Pass],
 ) -> Result<View, ExchangeFailure> {
-    let verdict = inspect(points, thickness);
+    let verdict = plan(points, thickness);
     let pourable = match &verdict {
         Ok(_) => true,
-        Err(OutlineProblem::Unsupported(_)) => false,
-        Err(OutlineProblem::Rejected(message)) => return Err(message.clone().into()),
+        Err(PlanProblem::Unsupported(_)) => false,
+        Err(PlanProblem::Rejected(message)) => return Err((*message).into()),
     };
+    if passes.len() > MAX_PASSES {
+        return Err(format!("В чертеж записывается до {MAX_PASSES} проходов").into());
+    }
+    for pass in passes {
+        pass.zone().map_err(str::to_string)?;
+    }
     let mut tx = conn.begin().await.map_err(database_error)?;
     let existing = lock_session(&mut tx, actor.id).await?;
     if let Some(row) = &existing
@@ -114,7 +123,8 @@ async fn save(
     if seen != revision {
         return Err("Чертёж уже изменился".into());
     }
-    let outline = serde_json::json!({ "points": points, "thickness_mm": thickness });
+    let outline =
+        serde_json::json!({ "points": points, "thickness_mm": thickness, "passes": passes });
     let blueprint: i64 = sqlx::query_scalar(
         "INSERT INTO blueprints(character_id,solver_version,material_id,material_version,time_scale,outline,pourable) \
          VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING id",
@@ -154,7 +164,12 @@ async fn save(
         .map_err(database_error)?;
     }
     tx.commit().await.map_err(|_| ExchangeFailure::Uncertain)?;
-    let message = if pourable {
+    let message = if pourable && !passes.is_empty() {
+        format!(
+            "Чертёж сохранён, проходов обработки в нём: {}. Металл не израсходован",
+            passes.len()
+        )
+    } else if pourable {
         "Чертёж сохранён. Металл не израсходован".into()
     } else {
         "Чертёж сохранён, но эта форма ветвится или имеет полость. Такой расчёт заливки пока неверен, металл не берём".into()
@@ -171,6 +186,8 @@ async fn save(
         result_item: None,
         center_tenth_mm: None,
         inertia_mg_m2: None,
+        passes: Vec::new(),
+        blueprint_passes: passes.to_vec(),
         update: None,
     })
 }
@@ -332,7 +349,7 @@ async fn pour_cavity(
         }
         let outline = outline_of(&mut tx, row.blueprint_id).await?;
         let spans =
-            inspect(&outline.points, &outline.thickness_mm).map_err(|problem| problem.message())?;
+            plan(&outline.points, &outline.thickness_mm).map_err(|problem| problem.message())?;
         let (gate_mm2, ideal_feed, seconds) = if row.phase == Phase::Pouring {
             let stored_gate = row.gate_mm2.unwrap_or(0);
             if !(1..=100).contains(&stored_gate) || !(0..=60).contains(&row.pour_seconds) {
@@ -544,8 +561,8 @@ async fn finish_from_checkpoint(
         inventory::insert(&mut tx, Some(actor.id), &bronze).await?;
     }
     sqlx::query(
-        "INSERT INTO item_bodies(item_id,solver_version,material_id,material_version,mass_mg,feed_status,geometry,defects,center_m,inertia_kg_m2) \
-         VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)",
+        "INSERT INTO item_bodies(item_id,solver_version,material_id,material_version,mass_mg,feed_status,geometry,defects,center_m,inertia_kg_m2,blueprint_id) \
+         VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)",
     )
     .bind(item)
     .bind(SOLVER_VERSION as i32)
@@ -557,6 +574,7 @@ async fn finish_from_checkpoint(
     .bind(serde_json::to_value(&stored.defects).map_err(|_| "Не удалось записать дефекты")?)
     .bind(stored.center_m)
     .bind(stored.inertia)
+    .bind(row.blueprint_id)
     .execute(&mut *tx)
     .await
     .map_err(database_error)?;
@@ -595,6 +613,8 @@ async fn finish_from_checkpoint(
         result_item: Some(item),
         center_tenth_mm,
         inertia_mg_m2,
+        passes: Vec::new(),
+        blueprint_passes: row.blueprint_passes.clone(),
         update: Some(Box::new(InventoryUpdate {
             character: sheet,
             actor,
@@ -608,7 +628,7 @@ async fn cool_blank(
     item: i64,
 ) -> Result<View, ExchangeFailure> {
     let mut tx = conn.begin().await.map_err(database_error)?;
-    let _session = lock_session(&mut tx, actor.id).await?;
+    let session = lock_session(&mut tx, actor.id).await?;
     let mut held = lock_blank(&mut tx, actor, item).await?;
     let already_cold = held
         .spans
@@ -634,14 +654,64 @@ async fn cool_blank(
             seconds
         )
     };
-    publish(tx, actor, item, &held, seconds, message).await
+    publish(tx, actor, item, &held, session.as_ref(), seconds, message).await
 }
 
-struct Pass {
-    edge_tenth_mm: u16,
-    side: Side,
-    from_mm: Option<i32>,
-    to_mm: Option<i32>,
+enum Ground {
+    Removed(f64),
+    /// The zone holds only the empty misrun. Nothing is ground.
+    NoMetal,
+}
+
+/// One pass on a locked blank. Mass, balance and cells change only when metal is removed.
+fn grind(held: &mut Held, pass: &Pass) -> Result<Ground, String> {
+    let (from, to) = pass.zone()?;
+    let has_metal = held.spans.iter().any(|span| {
+        let mid = f64::from(span.x0_mm + span.x1_mm) / 2.;
+        span.fill_milli > 0 && mid >= f64::from(from) && mid <= f64::from(to)
+    });
+    if !has_metal {
+        return Ok(Ground::NoMetal);
+    }
+    let cut = bevel_cells(
+        &solid_cells(&held.spans),
+        f64::from(pass.edge_tenth_mm) * 1e-4,
+        pass.side.sides(),
+        (f64::from(from) / 1000., f64::from(to) / 1000.),
+        held.mass_mg as f64 / 1e6,
+        c90700().solidus,
+    )?;
+    let mass_mg = (cut.mass * 1e6).round().clamp(0., held.mass_mg as f64) as u64;
+    if mass_mg == 0 || mass_mg > held.mass_mg {
+        return Err("Съём не сходится с массой заготовки".into());
+    }
+    if cut.removed > 0. {
+        apply_cells(&mut held.spans, &cut.cells);
+        held.mass_mg = mass_mg;
+        held.center_m = Some(cut.center);
+        held.inertia = Some(cut.inertia);
+        remember(&mut held.passes, *pass)?;
+    }
+    Ok(Ground::Removed(cut.removed))
+}
+
+/// Each pass leaves every touched edge at the thinnest edge asked for, so the history is a set:
+/// a repeat of the same side and zone keeps only the sharper edge.
+fn remember(history: &mut Vec<Pass>, pass: Pass) -> Result<(), String> {
+    if let Some(same) = history
+        .iter_mut()
+        .find(|old| old.side == pass.side && old.zone() == pass.zone())
+    {
+        same.edge_tenth_mm = same.edge_tenth_mm.min(pass.edge_tenth_mm);
+        return Ok(());
+    }
+    if history.len() >= MAX_PASSES {
+        return Err(format!(
+            "У отливки уже {MAX_PASSES} разных проходов, больше чертёж не запишет"
+        ));
+    }
+    history.push(pass);
+    Ok(())
 }
 
 async fn machine_blank(
@@ -650,60 +720,72 @@ async fn machine_blank(
     item: i64,
     pass: Pass,
 ) -> Result<View, ExchangeFailure> {
-    let Pass {
-        edge_tenth_mm,
-        side,
-        from_mm,
-        to_mm,
-    } = pass;
-    if !(1..=40).contains(&edge_tenth_mm) {
-        return Err("Кромка задаётся от 0,1 до 4 мм".into());
-    }
-    let from = from_mm.unwrap_or(-2000);
-    let to = to_mm.unwrap_or(2000);
-    if from.abs() > 2000 || to.abs() > 2000 || from >= to {
-        return Err("Зона обработки задаётся внутри чертежа, начало раньше конца".into());
-    }
+    let (from, to) = pass.zone().map_err(str::to_string)?;
     let mut tx = conn.begin().await.map_err(database_error)?;
-    let _session = lock_session(&mut tx, actor.id).await?;
+    let session = lock_session(&mut tx, actor.id).await?;
     let mut held = lock_blank(&mut tx, actor, item).await?;
-    let edge = f64::from(edge_tenth_mm) * 1e-4;
-    let cut = bevel_cells(
-        &solid_cells(&held.spans),
-        edge,
-        side.sides(),
-        (f64::from(from) / 1000., f64::from(to) / 1000.),
-        held.mass_mg as f64 / 1e6,
-        c90700().solidus,
-    )
-    .map_err(str::to_string)?;
-    let mass_mg = (cut.mass * 1e6).round().clamp(0., held.mass_mg as f64) as u64;
-    if mass_mg == 0 || mass_mg > held.mass_mg {
-        return Err("Съём не сходится с массой заготовки".into());
-    }
-    apply_cells(&mut held.spans, &cut.cells);
-    held.mass_mg = mass_mg;
-    held.center_m = Some(cut.center);
-    held.inertia = Some(cut.inertia);
-    let where_text = match side {
+    let removed = match grind(&mut held, &pass)? {
+        Ground::NoMetal => return Err("В этой зоне нет металла".into()),
+        Ground::Removed(removed) => removed,
+    };
+    let where_text = match pass.side {
         Side::Both => "с обеих сторон",
         Side::Left => "с левой стороны",
         Side::Right => "с правой стороны",
     };
-    let zone_text = match (from_mm, to_mm) {
+    let zone_text = match (pass.from_mm, pass.to_mm) {
         (None, None) => String::new(),
         _ => format!(" на участке {from}…{to} мм"),
     };
-    let message = if cut.removed <= 0. {
+    let message = if removed <= 0. {
         "Скос уже снят до этой кромки. Металл второй раз не снимается и не прибавляется".to_string()
     } else {
         format!(
             "Снят скос до {:.1} мм {where_text}{zone_text}, ушло {:.1} г. Стружка не возвращается в тигель, рукоять не прибавляется",
-            f64::from(edge_tenth_mm) / 10.,
-            cut.removed * 1e3
+            f64::from(pass.edge_tenth_mm) / 10.,
+            removed * 1e3
         )
     };
-    publish(tx, actor, item, &held, 0., message).await
+    publish(tx, actor, item, &held, session.as_ref(), 0., message).await
+}
+
+async fn finish_blank(
+    conn: &mut PgConnection,
+    actor: &Actor,
+    item: i64,
+) -> Result<View, ExchangeFailure> {
+    let mut tx = conn.begin().await.map_err(database_error)?;
+    let session = lock_session(&mut tx, actor.id).await?;
+    let mut held = lock_blank(&mut tx, actor, item).await?;
+    let Some(blueprint) = held.blueprint_id else {
+        return Err("Эта отливка сделана без записанного чертежа".into());
+    };
+    let outline = outline_of(&mut tx, Some(blueprint)).await?;
+    if outline.passes.is_empty() {
+        return Err("В чертеже этой отливки обработка не записана".into());
+    }
+    let before = held.mass_mg;
+    let mut skipped = 0;
+    for pass in &outline.passes {
+        if matches!(grind(&mut held, pass)?, Ground::NoMetal) {
+            skipped += 1;
+        }
+    }
+    let removed_g = before.saturating_sub(held.mass_mg) as f64 / 1000.;
+    let mut message = if removed_g > 0. {
+        format!(
+            "Обработка по чертежу: {} проходов, ушло {removed_g:.1} г",
+            outline.passes.len() - skipped
+        )
+    } else {
+        "Обработка по чертежу уже выполнена. Металл не снимается и не прибавляется".to_string()
+    };
+    if skipped > 0 {
+        message.push_str(&format!(
+            ". Пропущено проходов: {skipped}, на их участке нет металла"
+        ));
+    }
+    publish(tx, actor, item, &held, session.as_ref(), 0., message).await
 }
 
 /// A new stack goes into the bag when the carry limit still allows it.
@@ -735,6 +817,10 @@ struct Held {
     defects: Vec<Defect>,
     center_m: Option<f64>,
     inertia: Option<f64>,
+    /// Passes that removed metal from this blank.
+    passes: Vec<Pass>,
+    /// The blueprint the blank was cast from. Empty on blanks cast before it was recorded.
+    blueprint_id: Option<i64>,
 }
 
 async fn lock_blank(
@@ -744,7 +830,7 @@ async fn lock_blank(
 ) -> Result<Held, ExchangeFailure> {
     let row = sqlx::query(
         "SELECT i.mass_mg, i.character_id, i.place, i.x, i.z, b.geometry, b.defects, \
-         b.center_m, b.inertia_kg_m2 \
+         b.center_m, b.inertia_kg_m2, b.passes, b.blueprint_id \
          FROM items i JOIN item_bodies b ON b.item_id = i.id \
          WHERE i.id=$1 AND i.kind=$2 FOR UPDATE OF i",
     )
@@ -776,6 +862,9 @@ async fn lock_blank(
         defects,
         center_m: row.get("center_m"),
         inertia: row.get("inertia_kg_m2"),
+        passes: serde_json::from_value(row.get("passes"))
+            .map_err(|_| "Запись обработки отливки повреждена")?,
+        blueprint_id: row.get("blueprint_id"),
     })
 }
 
@@ -809,6 +898,7 @@ async fn publish(
     actor: &Actor,
     item: i64,
     held: &Held,
+    session: Option<&Session>,
     seconds: f64,
     message: String,
 ) -> Result<View, ExchangeFailure> {
@@ -820,7 +910,7 @@ async fn publish(
         .map_err(database_error)?;
     sqlx::query(
         "UPDATE item_bodies SET mass_mg=$2, geometry=$3, physical_s=physical_s+$4, \
-         center_m=$5, inertia_kg_m2=$6 WHERE item_id=$1",
+         center_m=$5, inertia_kg_m2=$6, passes=$7 WHERE item_id=$1",
     )
     .bind(item)
     .bind(held.mass_mg as i64)
@@ -828,6 +918,7 @@ async fn publish(
     .bind(seconds)
     .bind(held.center_m)
     .bind(held.inertia)
+    .bind(serde_json::to_value(&held.passes).map_err(|_| "Не удалось записать обработку")?)
     .execute(&mut *tx)
     .await
     .map_err(database_error)?;
@@ -856,6 +947,10 @@ async fn publish(
         result_item: Some(item),
         center_tenth_mm: shown_axes(held.center_m, held.inertia).0,
         inertia_mg_m2: shown_axes(held.center_m, held.inertia).1,
+        passes: held.passes.clone(),
+        blueprint_passes: session
+            .map(|row| row.blueprint_passes.clone())
+            .unwrap_or_default(),
         update: Some(Box::new(InventoryUpdate {
             character: sheet,
             actor,
@@ -958,159 +1053,6 @@ fn slices_from(spans: &[Span]) -> Vec<[f64; 5]> {
         .collect()
 }
 
-#[derive(Debug)]
-enum OutlineProblem {
-    Rejected(String),
-    Unsupported(String),
-}
-impl OutlineProblem {
-    fn message(&self) -> String {
-        match self {
-            Self::Rejected(text) | Self::Unsupported(text) => text.clone(),
-        }
-    }
-}
-
-/// Planned cells with empty fill. Unsupported topology is not a mold.
-fn inspect(points: &[[i32; 2]], thickness: &[u16]) -> Result<Vec<Span>, OutlineProblem> {
-    if !(4..=MAX_POINTS).contains(&points.len()) {
-        return Err(OutlineProblem::Rejected("Контур — от 4 до 48 точек".into()));
-    }
-    if !(2..=8).contains(&thickness.len()) || thickness.iter().any(|t| !(1..=40).contains(t)) {
-        return Err(OutlineProblem::Rejected(
-            "Толщина задаётся в 2–8 местах, от 1 до 40 мм".into(),
-        ));
-    }
-    if points
-        .iter()
-        .any(|p| p[0].abs() > 2000 || p[1].abs() > 2000)
-    {
-        return Err(OutlineProblem::Rejected("Чертёж выходит за 2 м".into()));
-    }
-    if crosses_itself(points) {
-        return Err(OutlineProblem::Rejected(
-            "Контур пересекает сам себя".into(),
-        ));
-    }
-    let x_min = points.iter().map(|p| p[0]).min().unwrap_or(0);
-    let x_max = points.iter().map(|p| p[0]).max().unwrap_or(0);
-    let y_min = points.iter().map(|p| p[1]).min().unwrap_or(0);
-    let y_max = points.iter().map(|p| p[1]).max().unwrap_or(0);
-    if x_max - x_min < 20 || x_max - x_min < y_max - y_min {
-        return Err(OutlineProblem::Rejected(
-            "Положите длину формы вдоль чертежа, не короче 20 мм".into(),
-        ));
-    }
-    let mut spans = Vec::new();
-    let mut x = (f64::from(x_min) / 2.5).floor() * 2.5;
-    let end = f64::from(x_max);
-    let mut gap = false;
-    let mut branched = false;
-    while x + 2.5 <= end + 1e-6 {
-        let mid = x + 1.25;
-        let hits = crossings(points, mid);
-        if hits.len() > 2 {
-            branched = true;
-        } else if hits.len() == 2 {
-            if gap {
-                branched = true;
-            }
-            let width = hits[1] - hits[0];
-            if !(1. ..200.).contains(&width) {
-                return Err(OutlineProblem::Rejected(
-                    "Ширина сечения от 1 до 200 мм".into(),
-                ));
-            }
-            let along = (mid - f64::from(x_min)) / f64::from(x_max - x_min);
-            let thick = thickness_mm(thickness, along);
-            spans.push(Span {
-                x0_mm: x.round() as i32,
-                x1_mm: (x + 2.5).round() as i32,
-                width_mm: width.round() as u16,
-                thickness_mm: thick.round() as u16,
-                fill_milli: 0,
-                temperature_c: 0,
-                edges_tenth_mm: [0, 0],
-            });
-        } else if !spans.is_empty() {
-            gap = true;
-        }
-        x += 2.5;
-    }
-    if branched {
-        return Err(OutlineProblem::Unsupported(
-            "У формы несколько просветов на одном сечении".into(),
-        ));
-    }
-    if spans.len() < 4 {
-        return Err(OutlineProblem::Rejected("Контур не даёт полости".into()));
-    }
-    Ok(spans)
-}
-
-fn thickness_mm(samples: &[u16], along: f64) -> f64 {
-    let scaled = along.clamp(0., 1.) * (samples.len() - 1) as f64;
-    let index = scaled.floor() as usize;
-    let next = (index + 1).min(samples.len() - 1);
-    let mix = scaled - index as f64;
-    f64::from(samples[index]) * (1. - mix) + f64::from(samples[next]) * mix
-}
-
-fn crossings(points: &[[i32; 2]], x: f64) -> Vec<f64> {
-    let mut ys = Vec::new();
-    for index in 0..points.len() {
-        let mut x0 = f64::from(points[index][0]);
-        let mut y0 = f64::from(points[index][1]);
-        let next = points[(index + 1) % points.len()];
-        let mut x1 = f64::from(next[0]);
-        let mut y1 = f64::from(next[1]);
-        if (x0 - x1).abs() < 1e-9 {
-            continue;
-        }
-        if x0 > x1 {
-            std::mem::swap(&mut x0, &mut x1);
-            std::mem::swap(&mut y0, &mut y1);
-        }
-        if x < x0 || x >= x1 {
-            continue;
-        }
-        let t = (x - x0) / (x1 - x0);
-        ys.push(y0 + t * (y1 - y0));
-    }
-    ys.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    ys.dedup_by(|a, b| (*a - *b).abs() < 0.05);
-    ys
-}
-
-fn crosses_itself(points: &[[i32; 2]]) -> bool {
-    let n = points.len();
-    for i in 0..n {
-        for j in (i + 1)..n {
-            if i == j || (i + 1) % n == j || (j + 1) % n == i {
-                continue;
-            }
-            if proper_cross(
-                points[i],
-                points[(i + 1) % n],
-                points[j],
-                points[(j + 1) % n],
-            ) {
-                return true;
-            }
-        }
-    }
-    false
-}
-
-fn proper_cross(a: [i32; 2], b: [i32; 2], c: [i32; 2], d: [i32; 2]) -> bool {
-    fn side(p: [i32; 2], q: [i32; 2], r: [i32; 2]) -> i32 {
-        let value = (q[0] as i64 - p[0] as i64) * (r[1] as i64 - p[1] as i64)
-            - (q[1] as i64 - p[1] as i64) * (r[0] as i64 - p[0] as i64);
-        value.signum() as i32
-    }
-    side(a, b, c) * side(a, b, d) < 0 && side(c, d, a) * side(c, d, b) < 0
-}
-
 struct Session {
     blueprint_id: Option<i64>,
     revision: u64,
@@ -1123,6 +1065,7 @@ struct Session {
     pour_seconds: i32,
     checkpoint: Option<Stored>,
     result_item: Option<i64>,
+    blueprint_passes: Vec<Pass>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -1157,12 +1100,15 @@ struct Prepared {
 struct Outline {
     points: Vec<[i32; 2]>,
     thickness_mm: Vec<u16>,
+    #[serde(default)]
+    passes: Vec<Pass>,
 }
 
 async fn lock_session(tx: &mut PgConnection, character: i64) -> Result<Option<Session>, String> {
     let row = sqlx::query(
         "SELECT s.blueprint_id, s.revision, s.phase, s.charge_mg, s.temperature_c, s.checkpoint, \
-         s.result_item, s.gate_mm2, s.ideal_feed, s.pour_seconds, COALESCE(b.pourable, false) AS pourable \
+         s.result_item, s.gate_mm2, s.ideal_feed, s.pour_seconds, COALESCE(b.pourable, false) AS pourable, \
+         COALESCE(b.outline -> 'passes', '[]'::jsonb) AS blueprint_passes \
          FROM craft_sessions s LEFT JOIN blueprints b ON b.id = s.blueprint_id \
          WHERE s.character_id=$1 FOR UPDATE OF s",
     )
@@ -1198,6 +1144,8 @@ async fn lock_session(tx: &mut PgConnection, character: i64) -> Result<Option<Se
         pour_seconds: row.get("pour_seconds"),
         checkpoint,
         result_item: row.get("result_item"),
+        blueprint_passes: serde_json::from_value(row.get("blueprint_passes"))
+            .map_err(|_| "Обработка в чертеже повреждена".to_string())?,
     }))
 }
 
@@ -1231,6 +1179,8 @@ fn finished(row: &Session, message: &str) -> View {
         result_item: row.result_item,
         center_tenth_mm,
         inertia_mg_m2,
+        passes: Vec::new(),
+        blueprint_passes: row.blueprint_passes.clone(),
         update: None,
     }
 }
@@ -1279,6 +1229,8 @@ fn view_of(
         result_item: row.result_item,
         center_tenth_mm: None,
         inertia_mg_m2: None,
+        passes: Vec::new(),
+        blueprint_passes: row.blueprint_passes.clone(),
         update: sheet.map(|character| Box::new(InventoryUpdate { character, actor })),
     }
 }
@@ -1312,8 +1264,7 @@ fn smithy(world: &mortown_world::World) -> [f32; 2] {
 
 #[cfg(test)]
 mod tests {
-    use super::{OutlineProblem, inspect};
-    use mortown_protocol::casting::example_sword;
+    use mortown_protocol::casting::{PlanProblem, example_sword, plan as inspect};
 
     #[test]
     fn example_sword_is_one_cavity() {
@@ -1333,6 +1284,29 @@ mod tests {
         let points = [[0, 0], [200, 40], [0, 40], [200, 0]];
         let problem = inspect(&points, &[6, 6]).expect_err("crossed");
         assert!(problem.message().contains("пересекает"));
+    }
+
+    #[test]
+    fn the_history_keeps_the_sharper_repeat_and_has_a_limit() {
+        use mortown_protocol::casting::{MAX_PASSES, Pass, Side};
+        let pass = |edge, side, from| Pass {
+            edge_tenth_mm: edge,
+            side,
+            from_mm: Some(from),
+            to_mm: Some(from + 10),
+        };
+        let mut history = Vec::new();
+        super::remember(&mut history, pass(10, Side::Left, 0)).unwrap();
+        super::remember(&mut history, pass(5, Side::Left, 0)).unwrap();
+        super::remember(&mut history, pass(8, Side::Left, 0)).unwrap();
+        super::remember(&mut history, pass(8, Side::Right, 0)).unwrap();
+        assert_eq!(history, [pass(5, Side::Left, 0), pass(8, Side::Right, 0)]);
+        for from in 1..(MAX_PASSES as i32 - 1) {
+            super::remember(&mut history, pass(8, Side::Both, from * 20)).unwrap();
+        }
+        assert_eq!(history.len(), MAX_PASSES);
+        assert!(super::remember(&mut history, pass(8, Side::Both, 1000)).is_err());
+        assert!(super::remember(&mut history, pass(3, Side::Left, 0)).is_ok());
     }
 
     #[test]
@@ -1388,6 +1362,6 @@ mod tests {
             [0, 60],
         ];
         let problem = inspect(&points, &[6, 6, 6]).expect_err("two intervals");
-        assert!(matches!(problem, OutlineProblem::Unsupported(_)));
+        assert!(matches!(problem, PlanProblem::Unsupported(_)));
     }
 }

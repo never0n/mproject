@@ -4160,6 +4160,7 @@ async fn foundry_saves_a_drawing_and_keeps_a_misrun() {
                 revision: 0,
                 points: sword.clone(),
                 thickness_mm: thickness.clone(),
+                passes: Vec::new(),
             },
         },
     )
@@ -4203,6 +4204,7 @@ async fn foundry_saves_a_drawing_and_keeps_a_misrun() {
                 revision: view.revision,
                 points: branch,
                 thickness_mm: thickness.clone(),
+                passes: Vec::new(),
             },
         },
     )
@@ -4234,6 +4236,7 @@ async fn foundry_saves_a_drawing_and_keeps_a_misrun() {
                 revision: branched.revision,
                 points: sword.clone(),
                 thickness_mm: thickness.clone(),
+                passes: Vec::new(),
             },
         },
     )
@@ -4314,6 +4317,7 @@ async fn foundry_saves_a_drawing_and_keeps_a_misrun() {
                 revision: drawn.revision,
                 points: vec![[0, 0], [200, 40], [0, 40], [200, 0]],
                 thickness_mm: thickness.clone(),
+                passes: Vec::new(),
             },
         },
     )
@@ -4837,6 +4841,7 @@ async fn foundry_saves_a_drawing_and_keeps_a_misrun() {
                 revision: beveled_again.revision,
                 points: sword.clone(),
                 thickness_mm: thickness.clone(),
+                passes: Vec::new(),
             },
         },
     )
@@ -4997,6 +5002,7 @@ async fn foundry_saves_a_drawing_and_keeps_a_misrun() {
                 revision: short_cut.revision,
                 points: sword.clone(),
                 thickness_mm: thickness.clone(),
+                passes: Vec::new(),
             },
         },
     )
@@ -5142,6 +5148,7 @@ async fn foundry_saves_a_drawing_and_keeps_a_misrun() {
                 revision: early.revision,
                 points: sword.clone(),
                 thickness_mm: thickness.clone(),
+                passes: Vec::new(),
             },
         },
     )
@@ -5306,6 +5313,16 @@ async fn foundry_saves_a_drawing_and_keeps_a_misrun() {
         .await
         .unwrap();
     assert!(one_side_mass < starved_mass);
+    assert_eq!(
+        one_side.passes,
+        [casting::Pass {
+            edge_tenth_mm: 10,
+            side: casting::Side::Left,
+            from_mm: Some(tang_zone.0),
+            to_mm: Some(tang_zone.1),
+        }],
+        "the blank records the pass that removed its metal"
+    );
     tokio::time::sleep(Duration::from_millis(1100)).await;
     send(
         &mut socket,
@@ -5341,6 +5358,7 @@ async fn foundry_saves_a_drawing_and_keeps_a_misrun() {
                 revision: one_side.revision,
                 points: sword.clone(),
                 thickness_mm: thickness.clone(),
+                passes: one_side.passes.clone(),
             },
         },
     )
@@ -5349,6 +5367,7 @@ async fn foundry_saves_a_drawing_and_keeps_a_misrun() {
         ServerMessage::Cast { view } => view,
         other => panic!("reserved drawing: {other:?}"),
     };
+    assert_eq!(reserved_draw.blueprint_passes, one_side.passes);
     send(
         &mut socket,
         ClientMessage::Cast {
@@ -5406,8 +5425,119 @@ async fn foundry_saves_a_drawing_and_keeps_a_misrun() {
         "{}",
         reserved_pour.message
     );
-    assert!(reserved_pour.result_item.is_some());
+    let repeat = reserved_pour.result_item.expect("the second blank");
     assert_eq!(bronze_left(&server.pool).await, 0);
+    let linked: Option<i64> =
+        sqlx::query_scalar("SELECT blueprint_id FROM item_bodies WHERE item_id=$1")
+            .bind(repeat)
+            .fetch_one(&server.pool)
+            .await
+            .unwrap();
+    assert!(linked.is_some(), "the blank knows its blueprint");
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    send(
+        &mut socket,
+        ClientMessage::Cast {
+            command: Command::Finish { item: repeat },
+        },
+    )
+    .await;
+    match casting_reply(&mut socket).await {
+        ServerMessage::Error { message, fatal } => {
+            assert!(!fatal);
+            assert!(message.contains("остудите"), "{message}");
+        }
+        other => panic!("finishing a hot blank: {other:?}"),
+    }
+    send(
+        &mut socket,
+        ClientMessage::Cast {
+            command: Command::Cool { item: repeat },
+        },
+    )
+    .await;
+    match casting_reply(&mut socket).await {
+        ServerMessage::Cast { .. } => {}
+        other => panic!("cool the repeat: {other:?}"),
+    }
+    let repeat_mass: i64 = sqlx::query_scalar("SELECT mass_mg FROM items WHERE id=$1")
+        .bind(repeat)
+        .fetch_one(&server.pool)
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    send(
+        &mut socket,
+        ClientMessage::Cast {
+            command: Command::Finish { item: repeat },
+        },
+    )
+    .await;
+    let finished = match casting_reply(&mut socket).await {
+        ServerMessage::Cast { view } => view,
+        other => panic!("finish by the blueprint: {other:?}"),
+    };
+    assert!(
+        finished.message.contains("по чертежу"),
+        "{}",
+        finished.message
+    );
+    assert_eq!(finished.passes, one_side.passes);
+    assert!(
+        finished
+            .spans
+            .iter()
+            .any(|span| span.edges_tenth_mm == [10, 0])
+    );
+    assert!(
+        finished
+            .spans
+            .iter()
+            .filter(|span| span.fill_milli == 0)
+            .all(|span| span.edges_tenth_mm == [0, 0])
+    );
+    let finished_mass: i64 = sqlx::query_scalar("SELECT mass_mg FROM items WHERE id=$1")
+        .bind(repeat)
+        .fetch_one(&server.pool)
+        .await
+        .unwrap();
+    assert!(finished_mass < repeat_mass);
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    send(
+        &mut socket,
+        ClientMessage::Cast {
+            command: Command::Finish { item: repeat },
+        },
+    )
+    .await;
+    let again = match casting_reply(&mut socket).await {
+        ServerMessage::Cast { view } => view,
+        other => panic!("second finish: {other:?}"),
+    };
+    assert!(again.message.contains("уже выполнена"), "{}", again.message);
+    let again_mass: i64 = sqlx::query_scalar("SELECT mass_mg FROM items WHERE id=$1")
+        .bind(repeat)
+        .fetch_one(&server.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        again_mass, finished_mass,
+        "a repeated finish removes nothing"
+    );
+    send(
+        &mut socket,
+        ClientMessage::Cast {
+            command: Command::Finish { item: starved },
+        },
+    )
+    .await;
+    match casting_reply(&mut socket).await {
+        ServerMessage::Error { message, fatal } => {
+            assert!(!fatal);
+            assert!(message.contains("не записана"), "{message}");
+        }
+        other => panic!("finish without recorded passes: {other:?}"),
+    }
     stock(&server.pool, id, &[(items::BRONZE, 18)], None).await;
     sqlx::query(
         "INSERT INTO items(kind, quantity, place, character_id, cell) VALUES ($1, 200, 'bag', $2, 200)",
@@ -5422,9 +5552,10 @@ async fn foundry_saves_a_drawing_and_keeps_a_misrun() {
         &mut socket,
         ClientMessage::Cast {
             command: Command::Save {
-                revision: reserved_pour.revision,
+                revision: again.revision,
                 points: sword.clone(),
                 thickness_mm: thickness.clone(),
+                passes: Vec::new(),
             },
         },
     )
