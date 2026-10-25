@@ -7,9 +7,12 @@ use crate::{
     ui::{BUTTON, EDGE, GOLD, PANEL},
 };
 use bevy::{prelude::*, ui::FocusPolicy, window::PrimaryWindow};
-use mortown_protocol::casting::{self, Command, DefectKind, Phase};
+use mortown_protocol::casting::{self, Command, DefectKind, Phase, Side};
 
 const MARKS: usize = 48;
+/// Thickness samples evenly spaced from the first to the last point along the length.
+/// The server accepts 2–8 and interpolates between them.
+const STATIONS: usize = 8;
 const W: f32 = 640.;
 const H: f32 = 220.;
 const STRIP: f32 = 36.;
@@ -23,11 +26,18 @@ pub struct Board {
     pub open: bool,
     points: Vec<[i32; 2]>,
     closed: bool,
-    thickness: [u16; 3],
+    thickness: [u16; STATIONS],
+    station: usize,
     units: u16,
     revision: u64,
     drag: Option<usize>,
     shown: Option<u64>,
+    edge_tenth_mm: u16,
+    side: Side,
+    /// Drawing millimetres of the grinding zone. `None` is the whole blank.
+    zone: Option<(i32, i32)>,
+    /// The first strip click set a zone start and waits for the end.
+    zone_start: Option<i32>,
 }
 impl Default for Board {
     fn default() -> Self {
@@ -35,11 +45,16 @@ impl Default for Board {
             open: false,
             points: Vec::new(),
             closed: false,
-            thickness: [6, 6, 6],
+            thickness: [6; STATIONS],
+            station: 0,
             units: 18,
             revision: 0,
             drag: None,
             shown: None,
+            edge_tenth_mm: 1,
+            side: Side::Both,
+            zone: None,
+            zone_start: None,
         }
     }
 }
@@ -57,6 +72,15 @@ pub(crate) struct Bars;
 #[derive(Component)]
 pub(crate) struct Strip;
 #[derive(Component)]
+pub(crate) struct StripBars;
+/// Shared by the strip marks so the other node queries can exclude them.
+#[derive(Component)]
+pub(crate) struct Mark;
+#[derive(Component)]
+pub(crate) struct ZoneMark;
+#[derive(Component)]
+pub(crate) struct StationMark;
+#[derive(Component)]
 pub(crate) struct Note;
 #[derive(Component, Clone, Copy)]
 pub(crate) enum Action {
@@ -64,7 +88,8 @@ pub(crate) enum Action {
     Example,
     Close,
     Undo,
-    Thickness(usize, i16),
+    Station(i16),
+    Thickness(i16),
     /// Grow or shrink the whole outline. The server still checks the sent points.
     Scale(bool),
     Save,
@@ -73,6 +98,9 @@ pub(crate) enum Action {
     Heat,
     Pour(u16, u16),
     Cool,
+    Side,
+    EdgeStep(i16),
+    WholeZone,
     Machine,
 }
 
@@ -161,9 +189,14 @@ pub fn setup(mut commands: Commands, icons: Res<Icons>) {
                         },
                     ));
                 });
-                p.spawn(actionbar::label("Толщина вдоль длины", &icons.1, 12.));
+                p.spawn(actionbar::label(
+                    "Толщина вдоль длины. Два клика по полосе задают участок заточки",
+                    &icons.1,
+                    12.,
+                ));
                 p.spawn((
                     Strip,
+                    FocusPolicy::Block,
                     Node {
                         width: px(W),
                         height: px(STRIP),
@@ -172,7 +205,45 @@ pub fn setup(mut commands: Commands, icons: Res<Icons>) {
                     },
                     BackgroundColor(Color::srgb(0.06, 0.05, 0.04)),
                     BorderColor::all(EDGE),
-                ));
+                ))
+                .with_children(|s| {
+                    s.spawn((
+                        StripBars,
+                        Node {
+                            position_type: PositionType::Absolute,
+                            width: percent(100),
+                            height: percent(100),
+                            ..default()
+                        },
+                    ));
+                    s.spawn((
+                        Mark,
+                        ZoneMark,
+                        Node {
+                            display: Display::None,
+                            position_type: PositionType::Absolute,
+                            top: px(0),
+                            height: percent(100),
+                            border: UiRect::horizontal(px(2)),
+                            ..default()
+                        },
+                        BackgroundColor(Color::srgba(0.75, 0.85, 1., 0.18)),
+                        BorderColor::all(Color::srgb(0.75, 0.85, 1.)),
+                    ));
+                    s.spawn((
+                        Mark,
+                        StationMark,
+                        Node {
+                            display: Display::None,
+                            position_type: PositionType::Absolute,
+                            top: px(0),
+                            width: px(2),
+                            height: percent(100),
+                            ..default()
+                        },
+                        BackgroundColor(Color::srgb(0.93, 0.84, 0.62)),
+                    ));
+                });
                 p.spawn((Note, actionbar::label("", &icons.1, 13.)));
                 p.spawn(Node {
                     column_gap: px(8),
@@ -186,12 +257,10 @@ pub fn setup(mut commands: Commands, icons: Res<Icons>) {
                     button(p, &icons, Action::Undo, "Убрать точку");
                     button(p, &icons, Action::Scale(false), "Мельче");
                     button(p, &icons, Action::Scale(true), "Крупнее");
-                    for (station, name) in ["Основание", "Середина", "Остриё"].iter().enumerate() {
-                        let down = format!("{name} −");
-                        let up = format!("{name} +");
-                        button(p, &icons, Action::Thickness(station, -1), &down);
-                        button(p, &icons, Action::Thickness(station, 1), &up);
-                    }
+                    button(p, &icons, Action::Station(-1), "◀ Точка толщины");
+                    button(p, &icons, Action::Station(1), "Точка толщины ▶");
+                    button(p, &icons, Action::Thickness(-1), "Толщина −");
+                    button(p, &icons, Action::Thickness(1), "Толщина +");
                     button(p, &icons, Action::Save, "Сохранить чертёж");
                     button(p, &icons, Action::ChargeStep(-1), "Тигель −100 г");
                     button(p, &icons, Action::ChargeStep(1), "Тигель +100 г");
@@ -201,7 +270,11 @@ pub fn setup(mut commands: Commands, icons: Res<Icons>) {
                     button(p, &icons, Action::Pour(2, 0), "Залить, узкие ворота");
                     button(p, &icons, Action::Pour(25, 2), "Закрыть подачу через 2 с");
                     button(p, &icons, Action::Cool, "Остудить");
-                    button(p, &icons, Action::Machine, "Снять скос 0,1 мм");
+                    button(p, &icons, Action::Side, "Сторона кромки");
+                    button(p, &icons, Action::EdgeStep(-1), "Кромка −0,1 мм");
+                    button(p, &icons, Action::EdgeStep(1), "Кромка +0,1 мм");
+                    button(p, &icons, Action::WholeZone, "Вся длина");
+                    button(p, &icons, Action::Machine, "Заточить");
                     button(p, &icons, Action::Back, "← К ремеслу");
                 });
             });
@@ -232,6 +305,7 @@ pub fn input(
     window: Single<&Window, With<PrimaryWindow>>,
     buttons: Query<(&Action, &Interaction), Changed<Interaction>>,
     canvas: Query<(&ComputedNode, &UiGlobalTransform), With<Canvas>>,
+    strip: Query<(&ComputedNode, &UiGlobalTransform), With<Strip>>,
 ) {
     if network.mode != Mode::Online {
         board.open = false;
@@ -246,7 +320,7 @@ pub fn input(
             Action::Example => {
                 let (points, thickness) = casting::example_sword();
                 board.points = points;
-                board.thickness = [thickness[0], thickness[1], thickness[2]];
+                board.thickness = resample(&thickness);
                 board.closed = true;
             }
             Action::Close if board.points.len() >= 4 => board.closed = true,
@@ -260,9 +334,29 @@ pub fn input(
                     board.points = points;
                 }
             }
-            Action::Thickness(station, step) => {
-                let value = board.thickness[*station] as i16 + step;
-                board.thickness[*station] = value.clamp(1, 40) as u16;
+            Action::Station(step) => {
+                let value = board.station as i16 + step;
+                board.station = value.clamp(0, STATIONS as i16 - 1) as usize;
+            }
+            Action::Thickness(step) => {
+                let station = board.station;
+                let value = board.thickness[station] as i16 + step;
+                board.thickness[station] = value.clamp(1, 40) as u16;
+            }
+            Action::Side => {
+                board.side = match board.side {
+                    Side::Both => Side::Left,
+                    Side::Left => Side::Right,
+                    Side::Right => Side::Both,
+                };
+            }
+            Action::EdgeStep(step) => {
+                let value = board.edge_tenth_mm as i16 + step;
+                board.edge_tenth_mm = value.clamp(1, 40) as u16;
+            }
+            Action::WholeZone => {
+                board.zone = None;
+                board.zone_start = None;
             }
             Action::ChargeStep(step) => {
                 let value = board.units as i16 + step;
@@ -305,7 +399,10 @@ pub fn input(
                 if let Some(item) = network.casting.as_ref().and_then(|view| view.result_item) {
                     network.cast_request(Command::Machine {
                         item,
-                        edge_tenth_mm: 1,
+                        edge_tenth_mm: board.edge_tenth_mm,
+                        side: board.side,
+                        from_mm: board.zone.map(|zone| zone.0),
+                        to_mm: board.zone.map(|zone| zone.1),
                     });
                 }
             }
@@ -315,6 +412,25 @@ pub fn input(
     let Some(cursor) = window.physical_cursor_position() else {
         return;
     };
+    if board.open
+        && mouse.just_pressed(MouseButton::Left)
+        && let Some((node, transform)) = strip.iter().next()
+        && actionbar::contains(node, transform, cursor)
+        && let Some(inverse) = transform.try_inverse()
+    {
+        let local = inverse.transform_point2(cursor) + node.size() / 2.;
+        let u = (local.x / node.size().x).clamp(0., 1.);
+        let mm = (X0 + u * (X1 - X0)).round() as i32;
+        match board.zone_start.take() {
+            None => {
+                board.zone_start = Some(mm);
+                board.zone = None;
+            }
+            Some(start) if start != mm => board.zone = Some((start.min(mm), start.max(mm))),
+            Some(_) => {}
+        }
+        return;
+    }
     let Some((node, transform)) = canvas.iter().next() else {
         return;
     };
@@ -359,12 +475,17 @@ pub fn display(
     mut board: ResMut<Board>,
     network: Res<Network>,
     mut commands: Commands,
-    mut overlay: Query<&mut Node, (With<Overlay>, Without<Dot>, Without<Segment>)>,
+    mut overlay: Query<&mut Node, (With<Overlay>, Without<Dot>, Without<Segment>, Without<Mark>)>,
     mut note: Query<&mut Text, With<Note>>,
-    mut dots: Query<(&Dot, &mut Node), (Without<Segment>, Without<Overlay>)>,
-    mut segments: Query<(&Segment, &mut Node, &mut UiTransform), (Without<Dot>, Without<Overlay>)>,
+    mut dots: Query<(&Dot, &mut Node), (Without<Segment>, Without<Overlay>, Without<Mark>)>,
+    mut segments: Query<
+        (&Segment, &mut Node, &mut UiTransform),
+        (Without<Dot>, Without<Overlay>, Without<Mark>),
+    >,
+    mut zone_mark: Query<&mut Node, (With<ZoneMark>, Without<StationMark>)>,
+    mut station_mark: Query<&mut Node, (With<StationMark>, Without<ZoneMark>)>,
     bars: Query<Entity, With<Bars>>,
-    strips: Query<Entity, With<Strip>>,
+    strips: Query<Entity, With<StripBars>>,
 ) {
     let mut overlay = overlay.single_mut().unwrap();
     overlay.display = if board.open {
@@ -403,14 +524,46 @@ pub fn display(
             .as_ref()
             .and_then(edge_note)
             .unwrap_or_default();
+        let thickness = board
+            .thickness
+            .iter()
+            .enumerate()
+            .map(|(index, value)| {
+                if index == board.station {
+                    format!("[{value}]")
+                } else {
+                    value.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" / ");
+        let pass = pass_note(&board);
         text.0 = format!(
-            "Длина {length} мм, ширина {width} мм. Толщина {} / {} / {} мм. {edge}В тигель {} г. {phase}. {metal}{balance}{defects}{}",
-            board.thickness[0],
-            board.thickness[1],
-            board.thickness[2],
+            "Длина {length} мм, ширина {width} мм. Толщина {thickness} мм. {edge}{pass}В тигель {} г. {phase}. {metal}{balance}{defects}{}",
             u32::from(board.units) * 100,
             network.status
         );
+    }
+    if let Ok(mut mark) = zone_mark.single_mut() {
+        let zone = board.zone.or(board.zone_start.map(|start| (start, start)));
+        match zone {
+            Some((from, to)) => {
+                let left = x_px(from);
+                mark.display = Display::Flex;
+                mark.left = px(left);
+                mark.width = px((x_px(to) - left).max(2.));
+            }
+            None => mark.display = Display::None,
+        }
+    }
+    if let Ok(mut mark) = station_mark.single_mut() {
+        match station_mm(&board.points, board.station) {
+            Some(x) => {
+                mark.display = Display::Flex;
+                mark.left = px(x_px(x) - 1.);
+            }
+            None => mark.display = Display::None,
+        }
     }
     for (dot, mut node) in &mut dots {
         match board.points.get(dot.0) {
@@ -590,15 +743,72 @@ fn balance_note(view: &casting::View) -> String {
     }
 }
 
+/// Thinnest finished edge on each side of the blank, as the server stored it.
 fn edge_note(view: &casting::View) -> Option<String> {
-    let edge = view
-        .spans
-        .iter()
-        .filter(|span| span.fill_milli > 0)
-        .map(|span| span.edge_tenth_mm)
-        .max()
-        .filter(|edge| *edge > 0)?;
-    Some(format!("Кромка {},{} мм. ", edge / 10, edge % 10))
+    let thinnest = |side: usize| {
+        view.spans
+            .iter()
+            .filter(|span| span.fill_milli > 0)
+            .map(|span| span.edges_tenth_mm[side])
+            .filter(|edge| *edge > 0)
+            .min()
+    };
+    let shown = |edge: Option<u16>| match edge {
+        Some(edge) => format!("{},{} мм", edge / 10, edge % 10),
+        None => "не заточена".into(),
+    };
+    let (left, right) = (thinnest(0), thinnest(1));
+    if left.is_none() && right.is_none() {
+        return None;
+    }
+    Some(format!(
+        "Кромка слева {}, справа {}. ",
+        shown(left),
+        shown(right)
+    ))
+}
+
+fn pass_note(board: &Board) -> String {
+    let side = match board.side {
+        Side::Both => "обе стороны",
+        Side::Left => "левая сторона",
+        Side::Right => "правая сторона",
+    };
+    let zone = match (board.zone, board.zone_start) {
+        (Some((from, to)), _) => format!("участок {from}…{to} мм"),
+        (None, Some(start)) => format!("участок от {start} мм, укажите конец"),
+        (None, None) => "вся длина".into(),
+    };
+    format!(
+        "Заточка: {side}, до {},{} мм, {zone}. ",
+        board.edge_tenth_mm / 10,
+        board.edge_tenth_mm % 10
+    )
+}
+
+/// Drawing x of a thickness sample, evenly spaced over the outline's length.
+fn station_mm(points: &[[i32; 2]], station: usize) -> Option<i32> {
+    let min_x = points.iter().map(|point| point[0]).min()?;
+    let max_x = points.iter().map(|point| point[0]).max()?;
+    let along = station as f32 / (STATIONS - 1) as f32;
+    Some(min_x + ((max_x - min_x) as f32 * along).round() as i32)
+}
+
+/// Spread any number of evenly spaced samples over the editor's stations.
+fn resample(samples: &[u16]) -> [u16; STATIONS] {
+    let mut out = [6; STATIONS];
+    if samples.is_empty() {
+        return out;
+    }
+    for (index, value) in out.iter_mut().enumerate() {
+        let scaled = index as f32 / (STATIONS - 1) as f32 * (samples.len() - 1) as f32;
+        let low = scaled.floor() as usize;
+        let high = (low + 1).min(samples.len() - 1);
+        let mix = scaled - low as f32;
+        *value =
+            (f32::from(samples[low]) * (1. - mix) + f32::from(samples[high]) * mix).round() as u16;
+    }
+    out
 }
 
 fn defect_note(view: &casting::View) -> String {
@@ -690,7 +900,19 @@ fn phase_label(phase: Phase) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::scaled_outline;
+    use super::{STATIONS, resample, scaled_outline, station_mm};
+
+    #[test]
+    fn stations_span_the_outline_and_keep_a_sampled_taper() {
+        let points = [[-120, 0], [650, 0], [650, 20], [-120, 20]];
+        assert_eq!(station_mm(&points, 0), Some(-120));
+        assert_eq!(station_mm(&points, STATIONS - 1), Some(650));
+        assert_eq!(resample(&[6, 6, 6]), [6; STATIONS]);
+        let taper = resample(&[8, 4]);
+        assert_eq!(taper[0], 8);
+        assert_eq!(taper[STATIONS - 1], 4);
+        assert!(taper.windows(2).all(|pair| pair[0] >= pair[1]));
+    }
 
     #[test]
     fn overall_size_scales_about_the_centre_and_stays_on_the_sheet() {

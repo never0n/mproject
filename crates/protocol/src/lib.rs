@@ -27,7 +27,7 @@ pub mod transfer;
 pub mod weapons;
 pub mod work;
 /// Bump on any incompatible message change; client and server refuse to play on mismatch.
-pub const PROTOCOL_VERSION: u32 = 57;
+pub const PROTOCOL_VERSION: u32 = 58;
 /// Bump when world geometry/collision changes, so old clients can't desync movement.
 pub const WORLD_VERSION: &str = "mortown-10";
 /// One sentence for a protocol or world mismatch, on the login refusal and in the client.

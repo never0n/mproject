@@ -47,9 +47,31 @@ pub struct Span {
     /// 0 is empty metal, 1000 is a full cell.
     pub fill_milli: u16,
     pub temperature_c: i16,
-    /// Finished edge, in tenths of a millimetre. Zero is still a rectangle.
+    /// Finished edge of the `[left, right]` side, in tenths of a millimetre.
+    /// Zero keeps that side a rectangle. See [`Side`] for which side is which.
     #[serde(default)]
-    pub edge_tenth_mm: u16,
+    pub edges_tenth_mm: [u16; 2],
+}
+
+/// Long side of the blank. Looking from the tang toward the tip,
+/// `Left` is +y of the drawing and `Right` is −y.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Side {
+    #[default]
+    Both,
+    Left,
+    Right,
+}
+impl Side {
+    /// `[left, right]` sides this pass touches.
+    pub fn sides(self) -> [bool; 2] {
+        match self {
+            Self::Both => [true, true],
+            Self::Left => [true, false],
+            Self::Right => [false, true],
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -88,8 +110,19 @@ pub enum Command {
     },
     /// Lumped cool of one blank down to 300 °C. Does not change its mass.
     Cool { item: i64 },
-    /// Bevel metal that is already solid. Does not return stock and does not add a grip.
-    Machine { item: i64, edge_tenth_mm: u16 },
+    /// Grind a bevel on solid metal down to `edge_tenth_mm` on the chosen side, inside
+    /// `from_mm..to_mm` of the drawing (the whole blank when absent). A pass only thins an
+    /// edge; it never adds metal, returns stock or adds a grip.
+    Machine {
+        item: i64,
+        edge_tenth_mm: u16,
+        #[serde(default)]
+        side: Side,
+        #[serde(default)]
+        from_mm: Option<i32>,
+        #[serde(default)]
+        to_mm: Option<i32>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -174,9 +207,9 @@ pub fn blank_boxes(spans: &[Span]) -> Vec<BlankBox> {
     boxes
 }
 
-/// Triangle shell of the filled metal. A stored edge thins both sides; the middle half of the
-/// width stays at the full thickness. Empty cells are omitted, and the length axis stays centred
-/// on the whole mold.
+/// Triangle shell of the filled metal. Each stored edge thins the outer quarter of the width on
+/// its own side; the middle half stays at the full thickness. +z follows +y of the drawing, so
+/// the left side is +z. Empty cells are omitted, and the length axis stays centred on the whole mold.
 pub fn blank_shell(spans: &[Span]) -> Vec<[f32; 3]> {
     let Some(min_x) = spans.iter().map(|span| span.x0_mm).min() else {
         return Vec::new();
@@ -200,21 +233,23 @@ pub fn blank_shell(spans: &[Span]) -> Vec<[f32; 3]> {
         let mid = f64::from(span.x0_mm) / 1000. + length / 2. - origin;
         let x0 = mid as f32 - length as f32 / 2.;
         let x1 = mid as f32 + length as f32 / 2.;
-        let edge = f64::from(span.edge_tenth_mm) / 10_000.;
-        let edge = if edge > 0. && edge < thick {
-            edge as f32
-        } else {
-            thick as f32
-        };
+        let [left, right] = span.edges_tenth_mm.map(|edge| {
+            let edge = f64::from(edge) / 10_000.;
+            if edge > 0. && edge < thick {
+                edge as f32
+            } else {
+                thick as f32
+            }
+        });
         let thick = thick as f32;
         let half = width as f32 / 2.;
-        if (edge - thick).abs() < 1e-8 {
+        if (left - thick).abs() < 1e-8 && (right - thick).abs() < 1e-8 {
             push_section(&mut vertices, x0, x1, -half, half, thick, thick);
         } else {
             let quarter = half / 2.;
             push_section(&mut vertices, x0, x1, -quarter, quarter, thick, thick);
-            push_section(&mut vertices, x0, x1, -half, -quarter, edge, thick);
-            push_section(&mut vertices, x0, x1, quarter, half, thick, edge);
+            push_section(&mut vertices, x0, x1, -half, -quarter, right, thick);
+            push_section(&mut vertices, x0, x1, quarter, half, thick, left);
         }
     }
     vertices
@@ -289,8 +324,16 @@ mod tests {
             thickness_mm: 6,
             fill_milli: fill,
             temperature_c: 300,
-            edge_tenth_mm: 0,
+            edges_tenth_mm: [0, 0],
         }
+    }
+
+    fn top_at(shell: &[[f32; 3]], keep: impl Fn(f32) -> bool) -> f32 {
+        shell
+            .iter()
+            .filter(|p| keep(p[2]))
+            .map(|p| p[1])
+            .fold(0_f32, f32::max)
     }
 
     #[test]
@@ -306,20 +349,12 @@ mod tests {
     #[test]
     fn a_stored_edge_thins_the_sides_and_leaves_the_middle() {
         let mut solid = cell(0, 10, 1000);
-        solid.edge_tenth_mm = 20;
+        solid.edges_tenth_mm = [20, 20];
         let shell = blank_shell(&[solid, cell(10, 30, 0)]);
         assert!(!shell.is_empty());
         assert!(shell.iter().all(|p| p[0] <= 0. && p[0] >= -0.02));
-        let middle = shell
-            .iter()
-            .filter(|p| p[2].abs() <= 0.0051)
-            .map(|p| p[1])
-            .fold(0_f32, f32::max);
-        let outer = shell
-            .iter()
-            .filter(|p| p[2].abs() >= 0.009)
-            .map(|p| p[1])
-            .fold(0_f32, f32::max);
+        let middle = top_at(&shell, |z| z.abs() <= 0.0051);
+        let outer = top_at(&shell, |z| z.abs() >= 0.009);
         assert!((middle - 0.006).abs() < 1e-5, "{middle}");
         assert!((outer - 0.002).abs() < 1e-5, "{outer}");
         let plain = blank_shell(&[cell(0, 10, 1000)]);
@@ -327,6 +362,52 @@ mod tests {
             plain
                 .iter()
                 .all(|p| (p[1] - 0.006).abs() < 1e-5 || p[1].abs() < 1e-5)
+        );
+    }
+
+    #[test]
+    fn one_ground_side_leaves_the_other_square() {
+        let mut solid = cell(0, 10, 1000);
+        solid.edges_tenth_mm = [20, 0];
+        let shell = blank_shell(&[solid]);
+        let left = top_at(&shell, |z| z >= 0.009);
+        let right = top_at(&shell, |z| z <= -0.009);
+        assert!((left - 0.002).abs() < 1e-5, "{left}");
+        assert!((right - 0.006).abs() < 1e-5, "{right}");
+    }
+
+    #[test]
+    fn a_pass_names_its_sides_and_defaults_to_both() {
+        let machine: Command = serde_json::from_str(
+            r#"{"action":"machine","item":7,"edge_tenth_mm":5,"side":"left","from_mm":0,"to_mm":300}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            machine,
+            Command::Machine {
+                side: Side::Left,
+                from_mm: Some(0),
+                to_mm: Some(300),
+                ..
+            }
+        ));
+        let whole: Command =
+            serde_json::from_str(r#"{"action":"machine","item":7,"edge_tenth_mm":5}"#).unwrap();
+        assert!(matches!(
+            whole,
+            Command::Machine {
+                side: Side::Both,
+                from_mm: None,
+                to_mm: None,
+                ..
+            }
+        ));
+        assert!(
+            serde_json::from_str::<Span>(
+                r#"{"x0_mm":0,"x1_mm":1,"width_mm":1,"thickness_mm":1,"fill_milli":0,"temperature_c":0,"edge_tenth_mm":1}"#
+            )
+            .is_err(),
+            "a stored span must be migrated to edges_tenth_mm"
         );
     }
 }

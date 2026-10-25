@@ -15,7 +15,7 @@ use mortown_protocol::{
     Actor, Character,
     casting::{
         BRONZE_MG, Command, Defect, DefectKind, MATERIAL_ID, MATERIAL_VERSION, MAX_POINTS, Phase,
-        SOLVER_VERSION, Span, TIME_SCALE, View,
+        SOLVER_VERSION, Side, Span, TIME_SCALE, View,
     },
     items::{self, Location, Stack},
     objects::REACH,
@@ -74,7 +74,18 @@ pub async fn handle(
         Command::Machine {
             item,
             edge_tenth_mm,
-        } => machine_blank(conn, &actor, item, edge_tenth_mm).await,
+            side,
+            from_mm,
+            to_mm,
+        } => {
+            let pass = Pass {
+                edge_tenth_mm,
+                side,
+                from_mm,
+                to_mm,
+            };
+            machine_blank(conn, &actor, item, pass).await
+        }
     }
 }
 
@@ -626,14 +637,32 @@ async fn cool_blank(
     publish(tx, actor, item, &held, seconds, message).await
 }
 
+struct Pass {
+    edge_tenth_mm: u16,
+    side: Side,
+    from_mm: Option<i32>,
+    to_mm: Option<i32>,
+}
+
 async fn machine_blank(
     conn: &mut PgConnection,
     actor: &Actor,
     item: i64,
-    edge_tenth_mm: u16,
+    pass: Pass,
 ) -> Result<View, ExchangeFailure> {
+    let Pass {
+        edge_tenth_mm,
+        side,
+        from_mm,
+        to_mm,
+    } = pass;
     if !(1..=40).contains(&edge_tenth_mm) {
         return Err("Кромка задаётся от 0,1 до 4 мм".into());
+    }
+    let from = from_mm.unwrap_or(-2000);
+    let to = to_mm.unwrap_or(2000);
+    if from.abs() > 2000 || to.abs() > 2000 || from >= to {
+        return Err("Зона обработки задаётся внутри чертежа, начало раньше конца".into());
     }
     let mut tx = conn.begin().await.map_err(database_error)?;
     let _session = lock_session(&mut tx, actor.id).await?;
@@ -642,6 +671,8 @@ async fn machine_blank(
     let cut = bevel_cells(
         &solid_cells(&held.spans),
         edge,
+        side.sides(),
+        (f64::from(from) / 1000., f64::from(to) / 1000.),
         held.mass_mg as f64 / 1e6,
         c90700().solidus,
     )
@@ -654,11 +685,20 @@ async fn machine_blank(
     held.mass_mg = mass_mg;
     held.center_m = Some(cut.center);
     held.inertia = Some(cut.inertia);
+    let where_text = match side {
+        Side::Both => "с обеих сторон",
+        Side::Left => "с левой стороны",
+        Side::Right => "с правой стороны",
+    };
+    let zone_text = match (from_mm, to_mm) {
+        (None, None) => String::new(),
+        _ => format!(" на участке {from}…{to} мм"),
+    };
     let message = if cut.removed <= 0. {
-        "Скос уже снят. Металл второй раз не снимается".to_string()
+        "Скос уже снят до этой кромки. Металл второй раз не снимается и не прибавляется".to_string()
     } else {
         format!(
-            "Снят скос {:.1} мм, ушло {:.0} г. Стружка не возвращается в тигель, рукоять не прибавляется",
+            "Снят скос до {:.1} мм {where_text}{zone_text}, ушло {:.1} г. Стружка не возвращается в тигель, рукоять не прибавляется",
             f64::from(edge_tenth_mm) / 10.,
             cut.removed * 1e3
         )
@@ -749,7 +789,7 @@ fn solid_cells(spans: &[Span]) -> Vec<SolidCell> {
             thickness: f64::from(span.thickness_mm) / 1000.,
             fill: f64::from(span.fill_milli) / 1000.,
             temperature: f64::from(span.temperature_c),
-            edge: f64::from(span.edge_tenth_mm) / 10_000.,
+            edges: span.edges_tenth_mm.map(|edge| f64::from(edge) / 10_000.),
         })
         .collect()
 }
@@ -757,7 +797,9 @@ fn solid_cells(spans: &[Span]) -> Vec<SolidCell> {
 fn apply_cells(spans: &mut [Span], cells: &[SolidCell]) {
     for (span, cell) in spans.iter_mut().zip(cells) {
         span.temperature_c = cell.temperature.round().clamp(-32_768., 32_767.) as i16;
-        span.edge_tenth_mm = (cell.edge * 10_000.).round().clamp(0., 65_535.) as u16;
+        span.edges_tenth_mm = cell
+            .edges
+            .map(|edge| (edge * 10_000.).round().clamp(0., 65_535.) as u16);
         span.fill_milli = (cell.fill * 1000.).round().clamp(0., 1000.) as u16;
     }
 }
@@ -988,7 +1030,7 @@ fn inspect(points: &[[i32; 2]], thickness: &[u16]) -> Result<Vec<Span>, OutlineP
                 thickness_mm: thick.round() as u16,
                 fill_milli: 0,
                 temperature_c: 0,
-                edge_tenth_mm: 0,
+                edges_tenth_mm: [0, 0],
             });
         } else if !spans.is_empty() {
             gap = true;

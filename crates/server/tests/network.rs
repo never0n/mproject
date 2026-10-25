@@ -4647,6 +4647,9 @@ async fn foundry_saves_a_drawing_and_keeps_a_misrun() {
             command: Command::Machine {
                 item: first,
                 edge_tenth_mm: 1,
+                side: casting::Side::Both,
+                from_mm: None,
+                to_mm: None,
             },
         },
     )
@@ -4718,6 +4721,9 @@ async fn foundry_saves_a_drawing_and_keeps_a_misrun() {
             command: Command::Machine {
                 item: first,
                 edge_tenth_mm: 1,
+                side: casting::Side::Both,
+                from_mm: None,
+                to_mm: None,
             },
         },
     )
@@ -4771,6 +4777,9 @@ async fn foundry_saves_a_drawing_and_keeps_a_misrun() {
             command: Command::Machine {
                 item: first,
                 edge_tenth_mm: 1,
+                side: casting::Side::Both,
+                from_mm: None,
+                to_mm: None,
             },
         },
     )
@@ -4799,6 +4808,9 @@ async fn foundry_saves_a_drawing_and_keeps_a_misrun() {
             command: Command::Machine {
                 item: first,
                 edge_tenth_mm: 1,
+                side: casting::Side::Both,
+                from_mm: None,
+                to_mm: None,
             },
         },
     )
@@ -4935,6 +4947,9 @@ async fn foundry_saves_a_drawing_and_keeps_a_misrun() {
             command: Command::Machine {
                 item: second,
                 edge_tenth_mm: 1,
+                side: casting::Side::Both,
+                from_mm: None,
+                to_mm: None,
             },
         },
     )
@@ -4944,13 +4959,18 @@ async fn foundry_saves_a_drawing_and_keeps_a_misrun() {
         other => panic!("short bevel: {other:?}"),
     };
     assert!(short_cut.spans.iter().any(|span| span.fill_milli == 0));
-    assert!(short_cut.spans.iter().any(|span| span.edge_tenth_mm == 1));
+    assert!(
+        short_cut
+            .spans
+            .iter()
+            .any(|span| span.edges_tenth_mm == [1, 1])
+    );
     assert!(
         short_cut
             .spans
             .iter()
             .filter(|span| span.fill_milli == 0)
-            .all(|span| span.edge_tenth_mm == 0)
+            .all(|span| span.edges_tenth_mm == [0, 0])
     );
     let short_mass: i64 = sqlx::query_scalar("SELECT mass_mg FROM items WHERE id=$1")
         .bind(second)
@@ -5107,7 +5127,7 @@ async fn foundry_saves_a_drawing_and_keeps_a_misrun() {
             .fetch_one(&server.pool)
             .await
             .unwrap();
-    assert!(edge.contains("\"edge_tenth_mm\": 1"), "{edge}");
+    assert!(edge.contains("\"edges_tenth_mm\": [1, 1]"), "{edge}");
     let bodies: i64 = sqlx::query_scalar("SELECT count(*) FROM item_bodies WHERE item_id=$1")
         .bind(first)
         .fetch_one(&server.pool)
@@ -5236,11 +5256,89 @@ async fn foundry_saves_a_drawing_and_keeps_a_misrun() {
         .unwrap();
     assert_eq!(starved_after, starved_mass);
     tokio::time::sleep(Duration::from_millis(1100)).await;
+    let tang_zone = (-120, -60);
+    send(
+        &mut socket,
+        ClientMessage::Cast {
+            command: Command::Machine {
+                item: starved,
+                edge_tenth_mm: 10,
+                side: casting::Side::Left,
+                from_mm: Some(tang_zone.0),
+                to_mm: Some(tang_zone.1),
+            },
+        },
+    )
+    .await;
+    let one_side = match casting_reply(&mut socket).await {
+        ServerMessage::Cast { view } => view,
+        other => panic!("one-sided pass: {other:?}"),
+    };
+    assert!(
+        one_side.message.contains("с левой стороны"),
+        "{}",
+        one_side.message
+    );
+    let inside = |span: &casting::Span| {
+        let mid = (span.x0_mm + span.x1_mm) as f64 / 2.;
+        span.fill_milli > 0 && mid >= f64::from(tang_zone.0) && mid <= f64::from(tang_zone.1)
+    };
+    assert!(one_side.spans.iter().any(inside));
+    assert!(
+        one_side
+            .spans
+            .iter()
+            .filter(|span| inside(span))
+            .all(|span| span.edges_tenth_mm == [10, 0]),
+        "only the left side of the zone is ground"
+    );
+    assert!(
+        one_side
+            .spans
+            .iter()
+            .filter(|span| !inside(span))
+            .all(|span| span.edges_tenth_mm == [0, 0]),
+        "cells outside the zone keep their section"
+    );
+    let one_side_mass: i64 = sqlx::query_scalar("SELECT mass_mg FROM items WHERE id=$1")
+        .bind(starved)
+        .fetch_one(&server.pool)
+        .await
+        .unwrap();
+    assert!(one_side_mass < starved_mass);
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    send(
+        &mut socket,
+        ClientMessage::Cast {
+            command: Command::Machine {
+                item: starved,
+                edge_tenth_mm: 10,
+                side: casting::Side::Right,
+                from_mm: Some(300),
+                to_mm: Some(600),
+            },
+        },
+    )
+    .await;
+    match casting_reply(&mut socket).await {
+        ServerMessage::Error { message, fatal } => {
+            assert!(!fatal);
+            assert!(message.contains("нет металла"), "{message}");
+        }
+        other => panic!("grinding the empty misrun: {other:?}"),
+    }
+    let misrun_mass: i64 = sqlx::query_scalar("SELECT mass_mg FROM items WHERE id=$1")
+        .bind(starved)
+        .fetch_one(&server.pool)
+        .await
+        .unwrap();
+    assert_eq!(misrun_mass, one_side_mass);
+    tokio::time::sleep(Duration::from_millis(1100)).await;
     send(
         &mut socket,
         ClientMessage::Cast {
             command: Command::Save {
-                revision: starved_cool.revision,
+                revision: one_side.revision,
                 points: sword.clone(),
                 thickness_mm: thickness.clone(),
             },
@@ -5434,6 +5532,19 @@ async fn foundry_saves_a_drawing_and_keeps_a_misrun() {
         .await
         .unwrap();
     assert_eq!(short_owner, id);
+    let sided: (i64, serde_json::Value) = sqlx::query_as(
+        "SELECT i.mass_mg, b.geometry FROM items i JOIN item_bodies b ON b.item_id=i.id WHERE i.id=$1",
+    )
+    .bind(starved)
+    .fetch_one(&server.pool)
+    .await
+    .unwrap();
+    assert_eq!(sided.0, one_side_mass, "restart keeps the ground mass");
+    let sided: Vec<casting::Span> = serde_json::from_value(sided.1).unwrap();
+    assert!(
+        sided.iter().any(|span| span.edges_tenth_mm == [10, 0]),
+        "restart keeps the one-sided edge"
+    );
     let body_rows: i64 =
         sqlx::query_scalar("SELECT count(*) FROM item_bodies WHERE item_id=$1 OR item_id=$2")
             .bind(first)
