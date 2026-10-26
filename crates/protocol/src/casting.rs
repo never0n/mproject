@@ -222,7 +222,8 @@ pub struct View {
     /// Centre of mass along the drawing, in tenths of a millimetre. Empty when this reply has no blank.
     #[serde(default)]
     pub center_tenth_mm: Option<i32>,
-    /// Inertia about that centre, in mg·m². Empty when unknown. Not a combat bonus.
+    /// Inertia about the axis through the centre of mass, normal to the blade plane, in mg·m².
+    /// Empty when unknown. Not a combat bonus.
     #[serde(default)]
     pub inertia_mg_m2: Option<u64>,
     /// Passes that removed metal from the blank in this reply, in order.

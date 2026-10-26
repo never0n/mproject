@@ -1280,6 +1280,36 @@ mod tests {
     }
 
     #[test]
+    fn the_client_sees_the_same_sideways_balance_the_server_computes() {
+        use mortown_protocol::casting::lateral_center_mm;
+        let (points, thickness) = example_sword();
+        let mut spans = inspect(&points, &thickness).unwrap();
+        for span in &mut spans {
+            span.fill_milli = if span.x0_mm < 600 { 1000 } else { 0 };
+            span.temperature_c = 300;
+        }
+        let cells = super::solid_cells(&spans);
+        let ground = crate::crafting_physics::bevel_cells(
+            &cells,
+            0.0001,
+            [true, false],
+            (0., 0.6),
+            1.2,
+            831.,
+        )
+        .unwrap();
+        let mut shown = spans.clone();
+        super::apply_cells(&mut shown, &ground.cells);
+        let client = lateral_center_mm(&shown).unwrap();
+        assert!(client < -1., "{client}");
+        assert!(
+            (ground.lateral * 1000. - client).abs() < 1e-9,
+            "{} {client}",
+            ground.lateral * 1000.
+        );
+    }
+
+    #[test]
     fn a_crossed_outline_is_rejected() {
         let points = [[0, 0], [200, 40], [0, 40], [200, 0]];
         let problem = inspect(&points, &[6, 6]).expect_err("crossed");

@@ -915,7 +915,7 @@ fn empty_color(kind: Option<DefectKind>) -> Color {
 fn balance_note(view: &casting::View) -> String {
     let along = match (view.center_tenth_mm, view.inertia_mg_m2) {
         (Some(center), Some(inertia)) => format!(
-            "Центр масс {:.1} мм по чертежу, инерция вокруг него {:.4} кг·м². ",
+            "Центр масс {:.1} мм по чертежу, инерция поперёк плоскости клинка {:.4} кг·м². ",
             f64::from(center) / 10.,
             inertia as f64 / 1_000_000.
         ),

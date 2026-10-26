@@ -159,6 +159,20 @@ impl SolidCell {
             .sum::<f64>()
     }
 
+    /// Exact integrals of the bevelled section across the width `z` (+z is the left side):
+    /// area, `∫z dA` and `∫z² dA`. The middle half is full thickness; each outer quarter
+    /// tapers linearly to its edge, or stays full where the side is not ground.
+    fn section(&self) -> (f64, f64, f64) {
+        let t = self.thickness;
+        let a = self.width / 4.;
+        let [left, right] = self.edges.map(|edge| if edge > 0. { edge } else { t });
+        let area = 2. * a * t + a * (t + left) / 2. + a * (t + right) / 2.;
+        let first = 5. / 6. * a * a * (left - right);
+        let side = |edge: f64| 7. / 3. * a.powi(3) * t + (edge - t) * 17. / 12. * a.powi(3);
+        let second = 2. / 3. * a.powi(3) * t + side(left) + side(right);
+        (area, first, second)
+    }
+
     fn metal_volume(&self) -> f64 {
         if !self.occupied() {
             return 0.;
@@ -173,6 +187,9 @@ pub struct Bevel {
     pub mass: f64,
     pub removed: f64,
     pub center: f64,
+    /// Centre of mass across the width, metres, + toward the left side.
+    pub lateral: f64,
+    /// About the axis through the centre of mass, normal to the blade plane.
     pub inertia: f64,
 }
 
@@ -326,42 +343,48 @@ pub fn bevel_cells(
     Ok(bevel_report(&next, mass - removed, removed))
 }
 
-/// Centre of mass along the drawing and inertia about that centre. A grip that was not poured is not included.
+/// Centre of mass along the drawing and inertia about the axis through the centre of mass,
+/// normal to the blade plane. A grip that was not poured is not included.
 pub fn mass_axes(cells: &[SolidCell], mass: f64) -> (f64, f64) {
     let report = bevel_report(cells, mass, 0.);
     (report.center, report.inertia)
 }
 
 fn bevel_report(cells: &[SolidCell], mass: f64, removed: f64) -> Bevel {
-    let mut moment = 0.;
-    let mut spin = 0.;
-    let mut metal = 0.;
     let share: f64 = cells.iter().map(SolidCell::metal_volume).sum();
-    for cell in cells {
-        if !cell.occupied() || share <= 0. {
-            continue;
-        }
-        let part = mass * cell.metal_volume() / share;
-        let mid = cell.x0 + 0.5 * cell.length;
-        moment += part * mid;
+    let density = if share > 0. { mass / share } else { 0. };
+    let filled = || cells.iter().filter(|cell| cell.occupied());
+    let run = |cell: &SolidCell| cell.fill * cell.length;
+    let mid = |cell: &SolidCell| cell.x0 + 0.5 * cell.length;
+    let mut metal = 0.;
+    let mut moment = 0.;
+    let mut across = 0.;
+    for cell in filled() {
+        let (area, first, _) = cell.section();
+        let part = density * run(cell) * area;
         metal += part;
+        moment += part * mid(cell);
+        across += density * run(cell) * first;
     }
-    let center = if metal > 0. { moment / metal } else { 0. };
-    for cell in cells {
-        if !cell.occupied() || share <= 0. {
-            continue;
-        }
-        let part = mass * cell.metal_volume() / share;
-        let mid = cell.x0 + 0.5 * cell.length;
-        spin += part * (mid - center).powi(2)
-            + part * (cell.width.powi(2) + cell.thickness.powi(2)) / 12.;
+    let (center, lateral) = if metal > 0. {
+        (moment / metal, across / metal)
+    } else {
+        (0., 0.)
+    };
+    let mut spin = 0.;
+    for cell in filled() {
+        let (area, _, second) = cell.section();
+        let part = density * run(cell) * area;
+        spin += part * ((mid(cell) - center).powi(2) + run(cell).powi(2) / 12.)
+            + density * run(cell) * second;
     }
     Bevel {
         cells: cells.to_vec(),
         mass,
         removed,
         center,
-        inertia: spin,
+        lateral,
+        inertia: (spin - metal * lateral.powi(2)).max(0.),
     }
 }
 
@@ -549,6 +572,90 @@ mod tests {
             bevel_cells(&left.cells, 0.0005, [true, false], WHOLE, left.mass, 831.).unwrap();
         let expected = left.mass * (1. - (0.001 - 0.0005) / 8. / (0.006 - (0.006 - 0.001) / 8.));
         assert!((sharper.mass - expected).abs() < 1e-12, "{}", sharper.mass);
+    }
+
+    /// Top of the section the shell draws at `z`, metres.
+    fn height(cell: &SolidCell, z: f64) -> f64 {
+        let t = cell.thickness;
+        let quarter = cell.width / 4.;
+        let out = ((z.abs() - quarter) / quarter).max(0.);
+        let edge = cell.edges[if z > 0. { 0 } else { 1 }];
+        let edge = if edge > 0. { edge } else { t };
+        t + (edge - t) * out
+    }
+
+    #[test]
+    fn the_section_integrals_match_a_sliced_section() {
+        let mut cell = bar(0.);
+        cell.edges = [0.0001, 0.002];
+        let (area, first, second) = cell.section();
+        let steps = 200_000;
+        let dz = cell.width / steps as f64;
+        let (mut a, mut f, mut s) = (0., 0., 0.);
+        for step in 0..steps {
+            let z = -cell.width / 2. + (step as f64 + 0.5) * dz;
+            let h = height(&cell, z) * dz;
+            a += h;
+            f += h * z;
+            s += h * z * z;
+        }
+        assert!((area / a - 1.).abs() < 1e-9, "{area} {a}");
+        assert!((first / f - 1.).abs() < 1e-6, "{first} {f}");
+        assert!((second / s - 1.).abs() < 1e-9, "{second} {s}");
+        assert!((area * cell.length - cell.metal_volume()).abs() < 1e-15);
+        let mut even = bar(0.);
+        even.edges = [0.0001, 0.0001];
+        let published = even.width.powi(3) * (15. * 0.006 + 17. * 0.0001) / 384.;
+        assert!((even.section().2 / published - 1.).abs() < 1e-12);
+        assert_eq!(even.section().1, 0.);
+    }
+
+    #[test]
+    fn one_side_moves_the_balance_across_and_the_inertia_is_exact() {
+        let cells = [bar(0.), bar(0.1), bar(0.2)];
+        let mass = 3.;
+        let plain = bevel_report(&cells, mass, 0.);
+        assert_eq!(plain.lateral, 0.);
+        let rod = mass * (0.3_f64.powi(2) + 0.04_f64.powi(2)) / 12.;
+        assert!(
+            (plain.inertia / rod - 1.).abs() < 1e-12,
+            "{}",
+            plain.inertia
+        );
+        let left = bevel_cells(&cells, 0.0001, [true, false], WHOLE, mass, 831.).unwrap();
+        assert!(left.lateral < -0.002, "{}", left.lateral);
+        assert!(left.inertia < plain.inertia);
+        // Brute force over the blank: uniform density on the drawn section.
+        let (nx, nz) = (600, 4_000);
+        let (mut m, mut mx, mut mz) = (0., 0., 0.);
+        let mut points = Vec::new();
+        for cell in &left.cells {
+            for i in 0..nx {
+                let x = cell.x0 + (i as f64 + 0.5) * cell.length / nx as f64;
+                for k in 0..nz {
+                    let z = -cell.width / 2. + (k as f64 + 0.5) * cell.width / nz as f64;
+                    let w = height(cell, z);
+                    m += w;
+                    mx += w * x;
+                    mz += w * z;
+                    points.push((x, z, w));
+                }
+            }
+        }
+        let (cx, cz) = (mx / m, mz / m);
+        let spin: f64 = points
+            .iter()
+            .map(|(x, z, w)| w * ((x - cx).powi(2) + (z - cz).powi(2)))
+            .sum::<f64>()
+            * left.mass
+            / m;
+        assert!((left.center - cx).abs() < 1e-9, "{} {cx}", left.center);
+        assert!((left.lateral - cz).abs() < 1e-7, "{} {cz}", left.lateral);
+        assert!(
+            (left.inertia / spin - 1.).abs() < 1e-6,
+            "{} {spin}",
+            left.inertia
+        );
     }
 
     #[test]
