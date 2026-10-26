@@ -395,6 +395,7 @@ fn click_destination(
         (
             Without<inventory::PreviewCamera>,
             Without<inventory::PortraitCamera>,
+            Without<foundry::PreviewCamera>,
         ),
     >,
     player: Single<&Transform, With<Player>>,
@@ -705,6 +706,7 @@ fn update_camera(
             Without<Player>,
             Without<inventory::PreviewCamera>,
             Without<inventory::PortraitCamera>,
+            Without<foundry::PreviewCamera>,
         ),
     >,
 ) {

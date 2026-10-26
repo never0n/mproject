@@ -571,6 +571,7 @@ pub fn update_visibility(
             With<Camera3d>,
             Without<crate::inventory::PreviewCamera>,
             Without<crate::inventory::PortraitCamera>,
+            Without<crate::foundry::PreviewCamera>,
         ),
     >,
     mut details: Query<(&Transform, &mut Visibility), (With<Detail>, Without<Roof>)>,

@@ -11,6 +11,7 @@ use mortown_protocol::casting::{self, Command, DefectKind, Phase, Side};
 
 mod preview;
 pub use preview::update as preview;
+pub(crate) use preview::PreviewCamera;
 
 const MARKS: usize = 48;
 /// Thickness samples evenly spaced from the first to the last point along the length.
