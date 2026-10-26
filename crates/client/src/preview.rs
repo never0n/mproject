@@ -192,6 +192,39 @@ pub fn setup(
     if screen == "foundry" {
         foundry.open = true;
         foundry.example();
+        network.casting = Some(foundry_blank());
+    }
+}
+
+/// Fixture blank from the example drawing: the left side of the blade ground to 0.1 mm
+/// and the last 20 mm of the tip a misrun. No server values are invented for it.
+fn foundry_blank() -> mortown_protocol::casting::View {
+    use mortown_protocol::casting::{self, Phase};
+    let (points, thickness) = casting::example_sword();
+    let mut spans = casting::plan(&points, &thickness).unwrap_or_default();
+    for span in &mut spans {
+        let filled = span.x0_mm < 630;
+        span.fill_milli = if filled { 1000 } else { 0 };
+        span.temperature_c = if filled { 300 } else { 0 };
+        if filled && span.x0_mm >= 0 && span.thickness_mm > 0 {
+            span.edges_tenth_mm = [1, 0];
+        }
+    }
+    casting::View {
+        revision: 1,
+        phase: Phase::Poured,
+        pourable: true,
+        message: "Предпросмотр интерфейса: отливка не с сервера".into(),
+        charge_mg: 0,
+        temperature_c: Some(300),
+        spans,
+        defects: Vec::new(),
+        result_item: None,
+        center_tenth_mm: None,
+        inertia_mg_m2: None,
+        passes: Vec::new(),
+        blueprint_passes: Vec::new(),
+        update: None,
     }
 }
 
