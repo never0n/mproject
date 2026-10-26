@@ -53,6 +53,51 @@ pub struct Span {
     pub edges_tenth_mm: [u16; 2],
 }
 
+impl Span {
+    /// Finished edge of side `0` (left) or `1` (right) in millimetres, or `None` while that side
+    /// is still a rectangle. An edge as thick as the blank is not a bevel.
+    fn edge_mm(&self, side: usize) -> Option<f64> {
+        let edge = f64::from(*self.edges_tenth_mm.get(side)?) / 10.;
+        (edge > 0. && edge < f64::from(self.thickness_mm)).then_some(edge)
+    }
+
+    /// Bevel of side `0` (left) or `1` (right) as [`blank_shell`] draws it: its width across the
+    /// blank and the angle between the bevel and the flat face, `(mm, degrees)`. The model keeps
+    /// only the removed area, so it does not yet tell a one-face grind from a two-face one.
+    pub fn bevel(&self, side: usize) -> Option<(f64, f64)> {
+        let edge = self.edge_mm(side)?;
+        let width = f64::from(self.width_mm) / 4.;
+        (width > 0.).then(|| {
+            let drop = f64::from(self.thickness_mm) - edge;
+            (width, (drop / width).atan().to_degrees())
+        })
+    }
+}
+
+/// Centre of the metal across the width in millimetres, `+` toward the left side. Density is
+/// uniform and an empty misrun weighs nothing. The full-thickness middle is symmetric, so only
+/// unequal bevels move it: a sharper left side leaves the centre right of the axis.
+pub fn lateral_center_mm(spans: &[Span]) -> Option<f64> {
+    let mut volume = 0.;
+    let mut moment = 0.;
+    for span in spans {
+        let fill = f64::from(span.fill_milli) / 1000.;
+        let length = f64::from(span.x1_mm - span.x0_mm);
+        let width = f64::from(span.width_mm);
+        let thick = f64::from(span.thickness_mm);
+        if fill <= 0. || length <= 0. || width <= 0. || thick <= 0. {
+            continue;
+        }
+        let [left, right] = [0, 1].map(|side| span.edge_mm(side).unwrap_or(thick));
+        let quarter = width / 4.;
+        // Each outer quarter tapers linearly from `thick` to its edge.
+        let area = width * thick - quarter * (thick - left) / 2. - quarter * (thick - right) / 2.;
+        volume += fill * length * area;
+        moment += fill * length * 5. / 6. * quarter * quarter * (left - right);
+    }
+    (volume > 0.).then(|| moment / volume)
+}
+
 /// Long side of the blank. Looking from the tang toward the tip,
 /// `Left` is +y of the drawing and `Right` is −y.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -573,6 +618,69 @@ mod tests {
         let right = top_at(&shell, |z| z <= -0.009);
         assert!((left - 0.002).abs() < 1e-5, "{left}");
         assert!((right - 0.006).abs() < 1e-5, "{right}");
+    }
+
+    #[test]
+    fn the_bevel_reports_its_width_and_angle() {
+        let mut blade = cell(0, 10, 1000);
+        blade.width_mm = 48;
+        blade.edges_tenth_mm = [1, 0];
+        let (width, angle) = blade.bevel(0).unwrap();
+        assert!((width - 12.).abs() < 1e-12);
+        assert!((angle - (5.9_f64 / 12.).atan().to_degrees()).abs() < 1e-12);
+        assert!(blade.bevel(1).is_none(), "the square side has no bevel");
+        blade.edges_tenth_mm = [60, 0];
+        assert!(blade.bevel(0).is_none(), "an edge as thick as the blank");
+    }
+
+    /// Slices the section the shell draws and integrates it numerically.
+    fn sliced_center(span: &Span) -> f64 {
+        let width = f64::from(span.width_mm);
+        let thick = f64::from(span.thickness_mm);
+        let edge = |side: usize| match span.edges_tenth_mm[side] {
+            0 => thick,
+            e => f64::from(e) / 10.,
+        };
+        let steps = 200_000;
+        let (mut area, mut moment) = (0., 0.);
+        for step in 0..steps {
+            let z = -width / 2. + (step as f64 + 0.5) * width / steps as f64;
+            let out = (z.abs() - width / 4.).max(0.) / (width / 4.);
+            let tip = if z > 0. { edge(0) } else { edge(1) };
+            let top = thick + (tip - thick) * out;
+            area += top;
+            moment += top * z;
+        }
+        moment / area
+    }
+
+    #[test]
+    fn a_sharper_side_moves_the_centre_toward_the_thicker_one() {
+        let mut blade = cell(0, 100, 1000);
+        blade.width_mm = 48;
+        assert_eq!(lateral_center_mm(&[blade]), Some(0.));
+        blade.edges_tenth_mm = [1, 1];
+        assert!(lateral_center_mm(&[blade]).unwrap().abs() < 1e-12);
+        blade.edges_tenth_mm = [1, 0];
+        let left = lateral_center_mm(&[blade]).unwrap();
+        assert!(left < -2.7, "{left}");
+        assert!((left - sliced_center(&blade)).abs() < 1e-6, "{left}");
+        blade.edges_tenth_mm = [0, 20];
+        let right = lateral_center_mm(&[blade]).unwrap();
+        assert!(right > 0.);
+        assert!((right - sliced_center(&blade)).abs() < 1e-6, "{right}");
+        let empty = Span {
+            fill_milli: 0,
+            edges_tenth_mm: [0, 0],
+            ..blade
+        };
+        let short = Span {
+            fill_milli: 500,
+            ..blade
+        };
+        assert_eq!(lateral_center_mm(&[empty]), None);
+        assert!((lateral_center_mm(&[blade, empty]).unwrap() - right).abs() < 1e-12);
+        assert!((lateral_center_mm(&[short]).unwrap() - right).abs() < 1e-12);
     }
 
     #[test]
