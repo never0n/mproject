@@ -5694,3 +5694,299 @@ async fn foundry_saves_a_drawing_and_keeps_a_misrun() {
     task.await.unwrap();
     server.pool.close().await;
 }
+
+#[tokio::test]
+#[ignore = "requires a running development PostgreSQL"]
+async fn a_chest_keeps_a_casting_geometry_and_mass() {
+    use mortown_protocol::{objects::Command, transfer::ItemRequest};
+    let database = std::env::var("TEST_DATABASE_URL").unwrap();
+    let (server, address, stop, task) = launch(&database).await;
+    let name = format!(
+        "cch{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_micros()
+            % 1_000_000_000
+    );
+    register(&address, &name).await;
+    let mut socket = connect(&address).await;
+    send(&mut socket, login(&name, "test-password-06")).await;
+    list(&mut socket).await;
+    send(&mut socket, creation(&name)).await;
+    let id = list(&mut socket).await[0].id;
+    stock(&server.pool, id, &[(items::CHEST, 1)], None).await;
+    let geometry = serde_json::json!([{
+        "x0_mm": 0,
+        "x1_mm": 10,
+        "width_mm": 20,
+        "thickness_mm": 6,
+        "fill_milli": 1000,
+        "temperature_c": 300,
+        "edges_tenth_mm": [1, 0]
+    }]);
+    let casting: i64 = sqlx::query_scalar(
+        "INSERT INTO items(kind,quantity,place,character_id,cell,mass_mg) \
+         VALUES($1,1,'bag',$2,(SELECT COALESCE(max(cell)+1,0) FROM items WHERE character_id=$2 AND place='bag'),1428633) \
+         RETURNING id",
+    )
+    .bind(i16::from(items::CASTING))
+    .bind(id)
+    .fetch_one(&server.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO item_bodies(item_id,solver_version,material_id,material_version,mass_mg,feed_status,geometry,defects,center_m,inertia_kg_m2) \
+         VALUES($1,1,'C90700',1,1428633,'ideal_feeder',$2,'[]'::jsonb,0.004,0.06)",
+    )
+    .bind(casting)
+    .bind(&geometry)
+    .execute(&server.pool)
+    .await
+    .unwrap();
+    let spot = free_spot(&server).await;
+    sqlx::query("UPDATE characters SET x=$1, z=$2 WHERE id=$3")
+        .bind(spot[0])
+        .bind(spot[1])
+        .bind(id)
+        .execute(&server.pool)
+        .await
+        .unwrap();
+    enter(&mut socket, id).await;
+    server.simulation.lock().await.pin(id, spot);
+    let chest =
+        sqlx::query_scalar::<_, i64>("SELECT id FROM items WHERE character_id=$1 AND kind=$2")
+            .bind(id)
+            .bind(i16::from(items::CHEST))
+            .fetch_one(&server.pool)
+            .await
+            .unwrap();
+    let reply = act(&mut socket, Command::Place { item: chest }).await;
+    assert!(reply.update.is_some(), "{}", reply.message);
+    let container: i64 =
+        sqlx::query_scalar("SELECT id FROM world_objects WHERE placed_by=$1 ORDER BY id DESC LIMIT 1")
+            .bind(id)
+            .fetch_one(&server.pool)
+            .await
+            .unwrap();
+    let view = act(&mut socket, Command::Open { container })
+        .await
+        .view
+        .expect("open");
+    let put = act(
+        &mut socket,
+        Command::Put {
+            container,
+            revision: view.revision,
+            item: Some(ItemRequest {
+                item: casting,
+                quantity: 1,
+            }),
+            coins: 0,
+        },
+    )
+    .await;
+    let view = put.view.expect(&put.message);
+    assert!(
+        view.items.iter().any(|stack| {
+            stack.id == casting && stack.mass_mg == Some(1_428_633) && stack.kind == items::CASTING
+        }),
+        "{:?}",
+        view.items
+    );
+    let stored: (String, Option<i64>, Option<i64>, i64) = sqlx::query_as(
+        "SELECT place, character_id, container_id, mass_mg FROM items WHERE id=$1",
+    )
+    .bind(casting)
+    .fetch_one(&server.pool)
+    .await
+    .unwrap();
+    assert_eq!(stored, ("container".into(), None, Some(container), 1_428_633));
+    let body: (i64, serde_json::Value) =
+        sqlx::query_as("SELECT mass_mg, geometry FROM item_bodies WHERE item_id=$1")
+            .bind(casting)
+            .fetch_one(&server.pool)
+            .await
+            .unwrap();
+    assert_eq!(body.0, 1_428_633);
+    let spans: Vec<mortown_protocol::casting::Span> = serde_json::from_value(body.1).unwrap();
+    assert_eq!(spans[0].edges_tenth_mm, [1, 0]);
+    let take = act(
+        &mut socket,
+        Command::Take {
+            container,
+            revision: view.revision,
+            item: Some(ItemRequest {
+                item: casting,
+                quantity: 1,
+            }),
+            coins: 0,
+        },
+    )
+    .await;
+    assert!(take.view.is_some(), "{}", take.message);
+    let back: (String, Option<i64>, Option<i64>, i64) = sqlx::query_as(
+        "SELECT place, character_id, container_id, mass_mg FROM items WHERE id=$1",
+    )
+    .bind(casting)
+    .fetch_one(&server.pool)
+    .await
+    .unwrap();
+    assert_eq!(back, ("bag".into(), Some(id), None, 1_428_633));
+    let kept: (i64, serde_json::Value) =
+        sqlx::query_as("SELECT mass_mg, geometry FROM item_bodies WHERE item_id=$1")
+            .bind(casting)
+            .fetch_one(&server.pool)
+            .await
+            .unwrap();
+    assert_eq!(kept.0, 1_428_633);
+    let spans: Vec<mortown_protocol::casting::Span> = serde_json::from_value(kept.1).unwrap();
+    assert_eq!(spans[0].edges_tenth_mm, [1, 0]);
+    let bodies: i64 = sqlx::query_scalar("SELECT count(*) FROM item_bodies WHERE item_id=$1")
+        .bind(casting)
+        .fetch_one(&server.pool)
+        .await
+        .unwrap();
+    assert_eq!(bodies, 1, "put and take keep the same blank row");
+    sqlx::query("DELETE FROM accounts WHERE login=$1")
+        .bind(&name)
+        .execute(&server.pool)
+        .await
+        .unwrap();
+    stop.send_replace(true);
+    task.await.unwrap();
+    server.pool.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires a running development PostgreSQL"]
+async fn two_drawings_keep_separate_blueprints() {
+    use mortown_protocol::casting::{self, Command, Phase};
+    use mortown_world::stations::{Furnishing, STATIONS};
+    let database = std::env::var("TEST_DATABASE_URL").unwrap();
+    let (server, address, stop, task) = launch(&database).await;
+    let name = format!(
+        "bp{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_micros()
+            % 1_000_000_000
+    );
+    register(&address, &name).await;
+    let mut socket = connect(&address).await;
+    send(&mut socket, login(&name, "test-password-06")).await;
+    list(&mut socket).await;
+    send(&mut socket, creation(&name)).await;
+    let id = list(&mut socket).await[0].id;
+    let actor = enter(&mut socket, id).await;
+    let terrain = server.simulation.lock().await.terrain();
+    let station = STATIONS
+        .iter()
+        .copied()
+        .find(|s| s.furnishing == Furnishing::Smithy)
+        .unwrap();
+    let surface = station.work_surface(&terrain);
+    let target = [surface[0], surface[2]];
+    let mut stand = target;
+    'search: for radius in [0., 0.4, 0.8, 1.2, 1.8, 2.5, 3.5] {
+        for step in 0..12 {
+            let angle = step as f32 * std::f32::consts::PI / 6.;
+            let point = [
+                target[0] + radius * angle.cos(),
+                target[1] + radius * angle.sin(),
+            ];
+            if mortown_world::distance(point, target) <= mortown_protocol::objects::REACH
+                && terrain.walkable(point[0], point[1])
+            {
+                stand = point;
+                break 'search;
+            }
+        }
+    }
+    drop(terrain);
+    server.simulation.lock().await.pin(actor.id, stand);
+    let (sword, thickness) = casting::example_sword();
+    let bar = vec![[0, -10], [300, -10], [300, 10], [0, 10]];
+    let bar_thickness = vec![5_u16, 5, 4];
+    send(
+        &mut socket,
+        ClientMessage::Cast {
+            command: Command::Save {
+                revision: 0,
+                points: sword.clone(),
+                thickness_mm: thickness.clone(),
+                passes: Vec::new(),
+            },
+        },
+    )
+    .await;
+    let first = match casting_reply(&mut socket).await {
+        ServerMessage::Cast { view } => view,
+        other => panic!("first save: {other:?}"),
+    };
+    assert!(first.pourable, "{}", first.message);
+    assert_eq!(first.phase, Phase::Draft);
+    let first_id: i64 =
+        sqlx::query_scalar("SELECT blueprint_id FROM craft_sessions WHERE character_id=$1")
+            .bind(id)
+            .fetch_one(&server.pool)
+            .await
+            .unwrap();
+    send(
+        &mut socket,
+        ClientMessage::Cast {
+            command: Command::Save {
+                revision: first.revision,
+                points: bar.clone(),
+                thickness_mm: bar_thickness.clone(),
+                passes: Vec::new(),
+            },
+        },
+    )
+    .await;
+    let second = match casting_reply(&mut socket).await {
+        ServerMessage::Cast { view } => view,
+        other => panic!("second save: {other:?}"),
+    };
+    assert!(second.pourable, "{}", second.message);
+    assert_ne!(second.revision, first.revision);
+    let second_id: i64 =
+        sqlx::query_scalar("SELECT blueprint_id FROM craft_sessions WHERE character_id=$1")
+            .bind(id)
+            .fetch_one(&server.pool)
+            .await
+            .unwrap();
+    assert_ne!(first_id, second_id, "a new drawing gets its own blueprint row");
+    let outlines: Vec<(i64, serde_json::Value)> = sqlx::query_as(
+        "SELECT id, outline FROM blueprints WHERE character_id=$1 ORDER BY id",
+    )
+    .bind(id)
+    .fetch_all(&server.pool)
+    .await
+    .unwrap();
+    assert_eq!(outlines.len(), 2);
+    assert_eq!(outlines[0].0, first_id);
+    assert_eq!(outlines[1].0, second_id);
+    assert_ne!(outlines[0].1["points"], outlines[1].1["points"]);
+    assert_eq!(
+        outlines[0].1["points"],
+        serde_json::to_value(&sword).unwrap()
+    );
+    assert_eq!(
+        outlines[1].1["points"],
+        serde_json::to_value(&bar).unwrap()
+    );
+    assert_ne!(
+        outlines[0].1["thickness_mm"],
+        outlines[1].1["thickness_mm"]
+    );
+    sqlx::query("DELETE FROM accounts WHERE login=$1")
+        .bind(&name)
+        .execute(&server.pool)
+        .await
+        .unwrap();
+    stop.send_replace(true);
+    task.await.unwrap();
+    server.pool.close().await;
+}

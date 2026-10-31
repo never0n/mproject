@@ -177,6 +177,8 @@ pub(crate) enum Action {
     Thickness(i16),
     /// Grow or shrink the whole outline. The server still checks the sent points.
     Scale(bool),
+    /// Reflect the outline across its length so both long sides match. [PROPOSAL]
+    Mirror,
     Save,
     ChargeStep(i16),
     Charge,
@@ -368,6 +370,7 @@ pub fn setup(
                     button(p, &icons, Action::RedoEdit, "↷ Вернуть правку");
                     button(p, &icons, Action::Scale(false), "Мельче");
                     button(p, &icons, Action::Scale(true), "Крупнее");
+                    button(p, &icons, Action::Mirror, "Зеркало");
                     button(p, &icons, Action::Station(-1), "◀ Точка толщины");
                     button(p, &icons, Action::Station(1), "Точка толщины ▶");
                     button(p, &icons, Action::Thickness(-1), "Толщина −");
@@ -444,6 +447,11 @@ pub fn input(
             Action::Scale(grow) => {
                 let (num, den) = if *grow { (11, 10) } else { (10, 11) };
                 if let Some(points) = scaled_outline(&board.points, num, den) {
+                    board.points = points;
+                }
+            }
+            Action::Mirror => {
+                if let Some(points) = mirrored_outline(&board.points) {
                     board.points = points;
                 }
             }
@@ -622,13 +630,16 @@ pub fn input(
         if let Some(index) = near {
             board.drag = Some(index);
         } else if !board.closed && board.points.len() < MARKS {
-            board.points.push(mm);
+            let snapped = snapped_point(&board.points, mm, None);
+            board.points.push(snapped);
         }
     } else if mouse.pressed(MouseButton::Left)
         && let Some(index) = board.drag
-        && let Some(point) = board.points.get_mut(index)
     {
-        *point = mm;
+        let snapped = snapped_point(&board.points, mm, Some(index));
+        if let Some(point) = board.points.get_mut(index) {
+            *point = snapped;
+        }
     }
     if mouse.just_released(MouseButton::Left) {
         board.drag = None;
@@ -1063,6 +1074,54 @@ fn extent(points: &[[i32; 2]]) -> (i32, i32) {
     (max_x - min_x, max_y - min_y)
 }
 
+/// Pull a free point onto another point's vertical or horizontal line when it is within
+/// `SNAP_MM`. The dragged point itself is skipped. [PROPOSAL] alignment helper.
+const SNAP_MM: i32 = 4;
+
+fn snapped_point(points: &[[i32; 2]], mm: [i32; 2], skip: Option<usize>) -> [i32; 2] {
+    let mut out = mm;
+    let mut best_x = SNAP_MM + 1;
+    let mut best_y = SNAP_MM + 1;
+    for (index, point) in points.iter().enumerate() {
+        if Some(index) == skip {
+            continue;
+        }
+        let dx = (point[0] - mm[0]).abs();
+        let dy = (point[1] - mm[1]).abs();
+        if dx < best_x {
+            best_x = dx;
+            out[0] = point[0];
+        }
+        if dy < best_y {
+            best_y = dy;
+            out[1] = point[1];
+        }
+    }
+    if best_x > SNAP_MM {
+        out[0] = mm[0];
+    }
+    if best_y > SNAP_MM {
+        out[1] = mm[1];
+    }
+    out
+}
+
+/// Reflect the outline across the length axis through its centre. The point order is
+/// reversed so the winding stays the same after the flip. `None` when there is nothing to flip.
+fn mirrored_outline(points: &[[i32; 2]]) -> Option<Vec<[i32; 2]>> {
+    if points.len() < 2 {
+        return None;
+    }
+    let n = i32::try_from(points.len()).ok()?;
+    let cy = points.iter().map(|point| point[1]).sum::<i32>() / n;
+    let mut mirrored: Vec<[i32; 2]> = points
+        .iter()
+        .map(|point| [point[0], 2 * cy - point[1]])
+        .collect();
+    mirrored.reverse();
+    (mirrored != points).then_some(mirrored)
+}
+
 /// Scale the outline about its centre. `None` when the result leaves the 2 m sheet or shrinks under 20 mm.
 fn scaled_outline(points: &[[i32; 2]], num: i32, den: i32) -> Option<Vec<[i32; 2]>> {
     if points.len() < 2 || den == 0 {
@@ -1105,7 +1164,10 @@ fn phase_label(phase: Phase) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{Board, HISTORY, STATIONS, resample, scaled_outline, station_mm};
+    use super::{
+        Board, HISTORY, STATIONS, mirrored_outline, resample, scaled_outline, snapped_point,
+        station_mm,
+    };
 
     #[test]
     fn stations_span_the_outline_and_keep_a_sampled_taper() {
@@ -1128,6 +1190,30 @@ mod tests {
             scaled_outline(&[[-1900, 0], [1900, 0], [1900, 20], [-1900, 20]], 11, 10).is_none()
         );
         assert!(scaled_outline(&[[0, 0], [20, 0], [20, 10], [0, 10]], 10, 11).is_none());
+    }
+
+    #[test]
+    fn a_near_point_snaps_to_existing_axes_and_ignores_itself() {
+        let points = [[0, 0], [100, 40], [40, 20]];
+        assert_eq!(snapped_point(&points, [2, 38], None), [0, 40]);
+        assert_eq!(snapped_point(&points, [50, 50], None), [50, 50]);
+        assert_eq!(
+            snapped_point(&[[10, 10], [10, 50]], [12, 12], Some(0)),
+            [10, 12],
+            "the dragged point does not snap to its own old place"
+        );
+    }
+
+    #[test]
+    fn a_mirror_flips_the_sides_and_keeps_the_winding() {
+        let skewed = [[0, 0], [100, 0], [100, 30], [0, 10]];
+        let mirrored = mirrored_outline(&skewed).unwrap();
+        assert_eq!(mirrored, [[0, 10], [100, -10], [100, 20], [0, 20]]);
+        let twice = mirrored_outline(&mirrored).unwrap();
+        assert_eq!(twice, skewed);
+        let square = [[0, 0], [40, 0], [40, 20], [0, 20]];
+        assert!(mirrored_outline(&square).is_none());
+        assert!(mirrored_outline(&[[0, 0]]).is_none());
     }
 
     #[test]
