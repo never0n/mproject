@@ -10,8 +10,8 @@ use bevy::{prelude::*, ui::FocusPolicy, window::PrimaryWindow};
 use mortown_protocol::casting::{self, Command, DefectKind, Phase, Side};
 
 mod preview;
-pub use preview::update as preview;
 pub(crate) use preview::PreviewCamera;
+pub use preview::update as preview;
 
 const MARKS: usize = 48;
 /// Thickness samples evenly spaced from the first to the last point along the length.
@@ -43,7 +43,23 @@ pub struct Board {
     /// The first strip click set a zone start and waits for the end.
     zone_start: Option<i32>,
     orbit: preview::Orbit,
+    /// Design states before each finished edit, newest last. Undo touches only the drawing:
+    /// metal already ground off a blank does not come back.
+    history: Vec<Design>,
+    future: Vec<Design>,
+    /// The design that the last finished edit left.
+    settled: Design,
 }
+
+const HISTORY: usize = 64;
+
+#[derive(Clone, Debug, Default, PartialEq)]
+struct Design {
+    points: Vec<[i32; 2]>,
+    closed: bool,
+    thickness: [u16; STATIONS],
+}
+
 impl Default for Board {
     fn default() -> Self {
         Self {
@@ -61,10 +77,63 @@ impl Default for Board {
             zone: None,
             zone_start: None,
             orbit: preview::Orbit::default(),
+            history: Vec::new(),
+            future: Vec::new(),
+            settled: Design {
+                thickness: [6; STATIONS],
+                ..default()
+            },
         }
     }
 }
 impl Board {
+    fn design(&self) -> Design {
+        Design {
+            points: self.points.clone(),
+            closed: self.closed,
+            thickness: self.thickness,
+        }
+    }
+
+    fn restore(&mut self, design: Design) {
+        self.points = design.points.clone();
+        self.closed = design.closed;
+        self.thickness = design.thickness;
+        self.settled = design;
+        self.drag = None;
+    }
+
+    fn undo(&mut self) {
+        if let Some(previous) = self.history.pop() {
+            self.future.push(self.design());
+            self.restore(previous);
+        }
+    }
+
+    fn redo(&mut self) {
+        if let Some(next) = self.future.pop() {
+            self.history.push(self.design());
+            self.restore(next);
+        }
+    }
+
+    /// Records the design before a finished edit. A drag is one edit, kept until release.
+    fn settle(&mut self) {
+        if self.drag.is_some() {
+            return;
+        }
+        let now = self.design();
+        if now == self.settled {
+            return;
+        }
+        let before = std::mem::replace(&mut self.settled, now);
+        self.history.push(before);
+        if self.history.len() > HISTORY {
+            self.history.remove(0);
+        }
+        self.future.clear();
+    }
+
     pub(crate) fn example(&mut self) {
         let (points, thickness) = casting::example_sword();
         self.points = points;
@@ -101,7 +170,9 @@ pub(crate) enum Action {
     Back,
     Example,
     Close,
-    Undo,
+    RemovePoint,
+    UndoEdit,
+    RedoEdit,
     Station(i16),
     Thickness(i16),
     /// Grow or shrink the whole outline. The server still checks the sent points.
@@ -164,7 +235,7 @@ pub fn setup(
             .with_children(|p| {
                 p.spawn(actionbar::label("Литьё", &icons.1, 22.));
                 p.spawn(actionbar::label(
-                    "Клик ставит точку контура, перетаскивание двигает её. Сохранение чертёж не тратит металл.",
+                    "Клик ставит точку контура, перетаскивание двигает её. Сохранение чертёж не тратит металл. Отмена правит только проект: снятый с отливки металл не возвращается.",
                     &icons.1,
                     12.,
                 ));
@@ -292,7 +363,9 @@ pub fn setup(
                 .with_children(|p| {
                     button(p, &icons, Action::Example, "Пример меча");
                     button(p, &icons, Action::Close, "Замкнуть");
-                    button(p, &icons, Action::Undo, "Убрать точку");
+                    button(p, &icons, Action::RemovePoint, "Убрать точку");
+                    button(p, &icons, Action::UndoEdit, "↶ Отменить правку");
+                    button(p, &icons, Action::RedoEdit, "↷ Вернуть правку");
                     button(p, &icons, Action::Scale(false), "Мельче");
                     button(p, &icons, Action::Scale(true), "Крупнее");
                     button(p, &icons, Action::Station(-1), "◀ Точка толщины");
@@ -362,10 +435,12 @@ pub fn input(
             Action::Back => board.open = false,
             Action::Example => board.example(),
             Action::Close if board.points.len() >= 4 => board.closed = true,
-            Action::Undo => {
+            Action::RemovePoint => {
                 board.points.pop();
                 board.closed = false;
             }
+            Action::UndoEdit => board.undo(),
+            Action::RedoEdit => board.redo(),
             Action::Scale(grow) => {
                 let (num, den) = if *grow { (11, 10) } else { (10, 11) };
                 if let Some(points) = scaled_outline(&board.points, num, den) {
@@ -558,6 +633,10 @@ pub fn input(
     if mouse.just_released(MouseButton::Left) {
         board.drag = None;
     }
+}
+
+pub fn history(mut board: ResMut<Board>) {
+    board.settle();
 }
 
 pub fn display(
@@ -834,36 +913,61 @@ fn empty_color(kind: Option<DefectKind>) -> Color {
 }
 
 fn balance_note(view: &casting::View) -> String {
-    match (view.center_tenth_mm, view.inertia_mg_m2) {
+    let along = match (view.center_tenth_mm, view.inertia_mg_m2) {
         (Some(center), Some(inertia)) => format!(
-            "Центр масс {:.1} мм по чертежу, инерция вокруг него {:.4} кг·м². ",
+            "Центр масс {:.1} мм по чертежу, инерция поперёк плоскости клинка {:.4} кг·м². ",
             f64::from(center) / 10.,
             inertia as f64 / 1_000_000.
         ),
         _ => String::new(),
-    }
+    };
+    let across = match casting::lateral_center_mm(&view.spans) {
+        Some(offset) if offset >= 0.05 => format!("Центр масс смещён на {offset:.1} мм влево. "),
+        Some(offset) if offset <= -0.05 => {
+            format!("Центр масс смещён на {:.1} мм вправо. ", -offset)
+        }
+        _ => String::new(),
+    };
+    format!("{along}{across}")
 }
 
-/// Thinnest finished edge on each side of the blank, as the server stored it.
+/// Each side's thinnest finished edge and its bevel along the blank, from the server's geometry.
 fn edge_note(view: &casting::View) -> Option<String> {
-    let thinnest = |side: usize| {
-        view.spans
-            .iter()
-            .filter(|span| span.fill_milli > 0)
+    let range = |values: &[f64], unit: &str| {
+        let low = values.iter().copied().fold(f64::INFINITY, f64::min);
+        let high = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        if high - low < 0.5 {
+            format!("{low:.0}{unit}")
+        } else {
+            format!("{low:.0}–{high:.0}{unit}")
+        }
+    };
+    let side = |side: usize| {
+        let filled = || view.spans.iter().filter(|span| span.fill_milli > 0);
+        let edge = filled()
             .map(|span| span.edges_tenth_mm[side])
             .filter(|edge| *edge > 0)
-            .min()
+            .min()?;
+        let (widths, angles): (Vec<f64>, Vec<f64>) =
+            filled().filter_map(|span| span.bevel(side)).unzip();
+        let bevel = if angles.is_empty() {
+            String::new()
+        } else {
+            format!(
+                ", угол {}, скос {}",
+                range(&angles, "°"),
+                range(&widths, " мм")
+            )
+        };
+        Some(format!("{},{} мм{bevel}", edge / 10, edge % 10))
     };
-    let shown = |edge: Option<u16>| match edge {
-        Some(edge) => format!("{},{} мм", edge / 10, edge % 10),
-        None => "не заточена".into(),
-    };
-    let (left, right) = (thinnest(0), thinnest(1));
+    let (left, right) = (side(0), side(1));
     if left.is_none() && right.is_none() {
         return None;
     }
+    let shown = |note: Option<String>| note.unwrap_or_else(|| "не заточена".into());
     Some(format!(
-        "Кромка слева {}, справа {}. ",
+        "Кромка слева {}; справа {}. ",
         shown(left),
         shown(right)
     ))
@@ -1001,7 +1105,7 @@ fn phase_label(phase: Phase) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{STATIONS, resample, scaled_outline, station_mm};
+    use super::{Board, HISTORY, STATIONS, resample, scaled_outline, station_mm};
 
     #[test]
     fn stations_span_the_outline_and_keep_a_sampled_taper() {
@@ -1024,5 +1128,49 @@ mod tests {
             scaled_outline(&[[-1900, 0], [1900, 0], [1900, 20], [-1900, 20]], 11, 10).is_none()
         );
         assert!(scaled_outline(&[[0, 0], [20, 0], [20, 10], [0, 10]], 10, 11).is_none());
+    }
+
+    #[test]
+    fn undo_steps_back_through_finished_edits_and_a_drag_is_one() {
+        let mut board = Board::default();
+        board.settle();
+        assert!(board.history.is_empty(), "nothing changed yet");
+        board.example();
+        board.settle();
+        let drawn = board.design();
+        board.drag = Some(0);
+        for step in 1..=5 {
+            board.points[0][0] += step;
+            board.settle();
+        }
+        board.drag = None;
+        board.settle();
+        let dragged = board.design();
+        board.thickness[3] = 9;
+        board.settle();
+        assert_eq!(board.history.len(), 3);
+        board.undo();
+        assert_eq!(board.design(), dragged);
+        board.undo();
+        assert_eq!(board.design(), drawn, "the whole drag is undone at once");
+        board.settle();
+        assert_eq!(board.future.len(), 2, "undo itself is not a new edit");
+        board.redo();
+        assert_eq!(board.design(), dragged);
+        board.points.pop();
+        board.settle();
+        assert!(board.future.is_empty(), "a new edit drops the redo branch");
+        board.undo();
+        assert_eq!(board.design(), dragged);
+    }
+
+    #[test]
+    fn undo_history_is_bounded() {
+        let mut board = Board::default();
+        for step in 0..HISTORY as u16 + 10 {
+            board.thickness[0] = 1 + step % 40;
+            board.settle();
+        }
+        assert_eq!(board.history.len(), HISTORY);
     }
 }

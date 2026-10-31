@@ -228,7 +228,7 @@ fn main() {
                     inventory::input,
                     skills::input,
                     crafting::input,
-                    foundry::input,
+                    (foundry::input, foundry::history).chain(),
                 )
                     .chain(),
                 (
